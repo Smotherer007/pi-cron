@@ -19,7 +19,7 @@ import { listRuns, readOutput } from "./core/runs.ts";
 import { describeSchedule, formatLocal } from "./core/schedule.ts";
 import { findJob, loadConfig, loadJobs, mutateJobs } from "./core/store.ts";
 import type { CronJob, DeliveryTarget } from "./core/types.ts";
-import { formatJobDetail, formatJobs, formatRunLine, toolsLabel } from "./format.ts";
+import { formatJobDetail, formatJobs, formatRunLine, toolsLabel, windowLabel } from "./format.ts";
 import { currentScheduler } from "./setup.ts";
 
 type Pi = Pick<ExtensionAPI, "getAllTools">;
@@ -47,6 +47,16 @@ function requireJob(jobs: readonly CronJob[], ref: string): CronJob {
 const scheduleHelp =
   'When to run, in the user\'s local time. Cron ("0 8 * * 1-5"), interval ("every 30m", "every 2h"), ' +
   'one-shot ("in 20m", "2026-10-01T09:00") or "daily 9:00", "weekdays 8:30", "mon,fri 17:00".';
+
+const windowHelp =
+  'Local time ("2026-10-01" or "2026-10-01 09:00", also "in 3d"). Use startAt/endAt when the job should only ' +
+  'run for a while instead of being deleted later.';
+
+/** Yields no run at all – worth saying out loud, the job is otherwise silently dead. */
+function windowNote(job: CronJob): string {
+  if (job.nextRunAt || (!job.startAt && !job.endAt)) return "";
+  return "\nNote: no run of that schedule fits the window; the job will not fire.";
+}
 
 const toolsParam = Type.Optional(
   Type.Array(Type.String(), {
@@ -84,12 +94,14 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
     label: "Create Cron Job",
     description:
       "Save a prompt as a scheduled job. At each due time a fresh, unattended pi session runs the prompt with only the listed tools; " +
-      "the answer is saved and delivered. Jobs are kept across restarts but only run while pi is open; slots missed while pi was closed run once at the next start.",
+      "the answer is saved and delivered. Jobs are kept across restarts but only run while pi is open; slots missed while pi was closed run once at the next start. " +
+      "Optional startAt/endAt limit the window in which the job runs.",
     promptSnippet: "Schedule a prompt with a tool allowlist as a recurring or one-shot cron job",
     promptGuidelines: [
       "Use cron_create when the user wants something done later or repeatedly (\"every morning\", \"each Friday\", \"in 2 hours\").",
       "Write the cron_create prompt as a complete, self-contained instruction: the run has no memory of this conversation.",
       "Give cron_create the smallest tool list the task needs, and check with cron_list before creating a duplicate.",
+      "Use startAt/endAt when the job should only run for a limited time (\"from October to the end of the year\"); it then stops on its own.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Short unique name, e.g. \"morning-inbox\"" }),
@@ -102,6 +114,8 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
       deliver: deliverParam,
       catchUp: Type.Optional(Type.Boolean({ description: "Run a slot missed while pi was closed once at the next start (default true)" })),
       timeoutMinutes: Type.Optional(Type.Number({ description: "Abort a run after this many minutes (default 30)" })),
+      startAt: Type.Optional(Type.String({ description: `Do not run before this time. ${windowHelp}` })),
+      endAt: Type.Optional(Type.String({ description: `Do not run after this time; the job ends there. ${windowHelp}` })),
     }),
     async execute(
       _id: string,
@@ -116,6 +130,8 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
         deliver?: DeliveryTarget[];
         catchUp?: boolean;
         timeoutMinutes?: number;
+        startAt?: string;
+        endAt?: string;
       },
       _signal: AbortSignal | undefined,
       _onUpdate: unknown,
@@ -131,8 +147,9 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
       const note = deps.schedulerActive()
         ? ""
         : "\nNote: jobs only run while an interactive pi is open; none is scheduling in this process.";
+      const window = windowLabel(job);
       return text(
-        `Created "${job.name}" – ${describeSchedule(job.schedule)}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}, tools: ${toolsLabel(job.tools)}.${note}`,
+        `Created "${job.name}" – ${describeSchedule(job.schedule)}${window ? `, ${window}` : ""}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}, tools: ${toolsLabel(job.tools)}.${windowNote(job)}${note}`,
         { job },
       );
     },
@@ -158,7 +175,8 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
   const cronUpdate = {
     name: "cron_update",
     label: "Update Cron Job",
-    description: "Change a job's prompt, schedule, tools, model, delivery or name. Set enabled=false to pause, true to resume.",
+    description:
+      "Change a job's prompt, schedule, tools, model, delivery, name or run window (startAt/endAt). Set enabled=false to pause, true to resume.",
     parameters: Type.Object({
       job: Type.String({ description: "Job name or id" }),
       name: Type.Optional(Type.String()),
@@ -174,6 +192,12 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
       enabled: Type.Optional(Type.Boolean({ description: "false pauses, true resumes" })),
       catchUp: Type.Optional(Type.Boolean()),
       timeoutMinutes: Type.Optional(Type.Number()),
+      startAt: Type.Optional(
+        Type.Union([Type.String(), Type.Null()], { description: `New window start (null clears it). ${windowHelp}` }),
+      ),
+      endAt: Type.Optional(
+        Type.Union([Type.String(), Type.Null()], { description: `New window end (null clears it). ${windowHelp}` }),
+      ),
     }),
     async execute(_id: string, params: { job: string } & JobPatch) {
       const { job: ref, ...patch } = params;
@@ -184,7 +208,7 @@ export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
         const updated = applyPatch(current, patch, jobs, now);
         return { jobs: jobs.map((j) => (j.id === current.id ? updated : j)), result: updated };
       });
-      return text(`Updated.\n${formatJobDetail(job)}`, { job });
+      return text(`Updated.\n${formatJobDetail(job)}${windowNote(job)}`, { job });
     },
   };
 

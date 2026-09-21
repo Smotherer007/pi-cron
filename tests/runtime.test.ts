@@ -63,6 +63,14 @@ describe("store", () => {
     assert.equal(withLock(() => 42), 42);
     assert.equal(existsSync(paths.lock()), false);
   });
+
+  it("fills the window in for a job written before it existed", () => {
+    const { startAt, endAt, ...old } = makeJob({ name: "legacy" });
+    saveJobs([old as CronJob]);
+    const [job] = loadJobs();
+    assert.equal(job.startAt, null);
+    assert.equal(job.endAt, null);
+  });
 });
 
 describe("executeJob", () => {

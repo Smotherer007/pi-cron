@@ -19,7 +19,7 @@ import { listRuns, markSeen, readOutput } from "./core/runs.ts";
 import { describeSchedule, formatLocal } from "./core/schedule.ts";
 import { findJob, loadConfig, loadJobs, mutateJobs, saveConfig } from "./core/store.ts";
 import type { CronJob } from "./core/types.ts";
-import { formatJobDetail, formatJobs, formatRunLine } from "./format.ts";
+import { formatJobDetail, formatJobs, formatRunLine, jobState, windowLabel } from "./format.ts";
 import { currentScheduler } from "./setup.ts";
 import { checkTools } from "./tools.ts";
 
@@ -53,6 +53,10 @@ async function addInteractive(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
   if (!name) return;
   const schedule = await ctx.ui.input("When? (cron, \"every 2h\", \"weekdays 8:00\", \"in 30m\")", "weekdays 8:00");
   if (!schedule) return;
+  const startAt = await ctx.ui.input("Start after? (empty = as soon as the schedule says)", "");
+  if (startAt === undefined) return;
+  const endAt = await ctx.ui.input("Stop after? (empty = never)", "");
+  if (endAt === undefined) return;
   const prompt = await ctx.ui.editor("Prompt the agent runs at that time", "");
   if (!prompt?.trim()) return;
   const active = pi.getActiveTools().join(",");
@@ -64,12 +68,18 @@ async function addInteractive(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
 
   const now = new Date();
   const job = mutateJobs((jobs) => {
-    const job = buildJob({ name, prompt, schedule, tools, cwd: ctx.cwd }, jobs, now, { deliver: loadConfig().defaultDeliver });
+    const job = buildJob(
+      { name, prompt, schedule, startAt: startAt.trim() || null, endAt: endAt.trim() || null, tools, cwd: ctx.cwd },
+      jobs,
+      now,
+      { deliver: loadConfig().defaultDeliver },
+    );
     return { jobs: [...jobs, job], result: job };
   });
+  const window = windowLabel(job);
   ctx.ui.notify(
-    `Created "${job.name}" – ${describeSchedule(job.schedule)}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}`,
-    "info",
+    `Created "${job.name}" – ${describeSchedule(job.schedule)}${window ? `, ${window}` : ""}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}${job.nextRunAt ? "" : " (it will not fire)"}`,
+    job.nextRunAt ? "info" : "warning",
   );
 }
 
@@ -88,8 +98,10 @@ export function statusText(now: Date = new Date()): string {
   const running = jobs.filter((j) => j.running).map((j) => j.name);
   return [
     `Scheduler: ${scheduler ? "active" : "inactive"} in this pi · ${who}`,
-    `Jobs: ${jobs.length} (${jobs.filter((j) => j.enabled).length} active)${running.length ? ` · running: ${running.join(", ")}` : ""}`,
-    next ? `Next: ${next.name} at ${formatLocal(new Date(next.nextRunAt as string))}` : null,
+    `Jobs: ${jobs.length} (${jobs.filter((j) => jobState(j) === "active").length} active)${running.length ? ` · running: ${running.join(", ")}` : ""}`,
+    next
+      ? `Next: ${next.name} at ${formatLocal(new Date(next.nextRunAt as string))}${next.endAt ? ` · window until ${formatLocal(new Date(next.endAt))}` : ""}`
+      : null,
   ]
     .filter(Boolean)
     .join("\n");
@@ -123,7 +135,8 @@ export async function handleCron(pi: ExtensionAPI, rawArgs: string, ctx: Extensi
     case "pause":
     case "resume": {
       const job = setEnabled(arg, sub === "resume");
-      ctx.ui.notify(`${job.name}: ${job.enabled ? `active, next ${formatLocal(new Date(job.nextRunAt as string))}` : "paused"}`, "info");
+      const state = job.enabled ? (job.nextRunAt ? `active, next ${formatLocal(new Date(job.nextRunAt))}` : "done, no further run") : "paused";
+      ctx.ui.notify(`${job.name}: ${state}`, "info");
       return;
     }
     case "remove":

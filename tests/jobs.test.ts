@@ -33,6 +33,27 @@ describe("buildJob", () => {
     );
     assert.throws(() => buildJob({ ...base, name: "a", timeoutMinutes: 0 }, [], now, { deliver: [] }), /timeoutMinutes/);
   });
+
+  it("keeps a run window as ISO timestamps", () => {
+    const job = makeJob({ schedule: "daily 9:00", startAt: "2026-10-01", endAt: "2026-12-31 23:59" });
+    assert.equal(job.startAt, local(2026, 10, 1).toISOString());
+    assert.equal(job.endAt, local(2026, 12, 31, 23, 59).toISOString());
+    assert.equal(job.nextRunAt, local(2026, 10, 1, 9, 0).toISOString());
+    assert.deepEqual(makeJob().startAt, null);
+  });
+
+  it("rejects a window that makes no sense", () => {
+    const base = { name: "a", prompt: "x", schedule: "every 1h", cwd: "/" };
+    assert.throws(() => buildJob({ ...base, endAt: "soon" }, [], now, { deliver: [] }), /Cannot understand endAt/);
+    assert.throws(() => buildJob({ ...base, startAt: "2026-10-01", endAt: "2026-10-01" }, [], now, { deliver: [] }), /must be after startAt/);
+    assert.throws(() => buildJob({ ...base, endAt: "2026-09-01" }, [], now, { deliver: [] }), /endAt .* is in the past/);
+    assert.equal(buildJob({ ...base, endAt: "2026-10-01" }, [], now, { deliver: [] }).endAt, local(2026, 10, 1).toISOString());
+  });
+
+  it("has no next run when the window excludes every slot", () => {
+    const job = makeJob({ schedule: "mon 9:00", startAt: "2026-09-22", endAt: "2026-09-23" }); // Tue–Wed
+    assert.equal(job.nextRunAt, null);
+  });
 });
 
 describe("applyPatch", () => {
@@ -60,5 +81,17 @@ describe("applyPatch", () => {
     const b = makeJob({ name: "b" });
     assert.throws(() => applyPatch(a, { name: "B" }, [a, b], now), /already exists/);
     assert.equal(applyPatch(a, { name: "a" }, [a, b], now).name, "a");
+  });
+
+  it("re-arms when the window moves", () => {
+    const job = makeJob(); // next 21 Sep 13:00
+    const limited = applyPatch(job, { startAt: "2026-10-01", endAt: null }, [job], now);
+    assert.equal(limited.nextRunAt, local(2026, 10, 1).toISOString());
+    const opened = applyPatch(limited, { startAt: null, endAt: null }, [limited], now);
+    assert.equal(opened.nextRunAt, local(2026, 9, 21, 13, 0).toISOString());
+
+    const later = local(2026, 9, 30, 9, 0);
+    const extended = applyPatch(makeJob({ endAt: "2026-09-21 23:00" }), { endAt: "2026-12-31" }, [], later);
+    assert.equal(extended.nextRunAt, local(2026, 9, 30, 10, 0).toISOString());
   });
 });

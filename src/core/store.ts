@@ -90,7 +90,8 @@ export function withLock<T>(fn: () => T): T {
 
 export function loadJobs(): CronJob[] {
   const file = readJson<JobsFile>(paths.jobs(), { version: 1, jobs: [] });
-  return [...(file.jobs ?? [])];
+  // jobs.json written before run windows existed has no startAt/endAt.
+  return [...(file.jobs ?? [])].map((job) => ({ ...job, startAt: job.startAt ?? null, endAt: job.endAt ?? null }));
 }
 
 export function saveJobs(jobs: readonly CronJob[]): void {

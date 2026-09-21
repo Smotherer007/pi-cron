@@ -73,6 +73,50 @@ describe("cron tools", () => {
     assert.equal(loadJobs().length, 0);
   });
 
+  it("creates a job with a run window and can clear it again", async () => {
+    const r = await call(tools.cronCreate, {
+      name: "sprint",
+      prompt: "p",
+      schedule: "daily 9:00",
+      startAt: "2026-10-01",
+      endAt: "2026-12-31 23:59",
+    });
+    assert.match(r.content[0].text, /from 2026-10-01 00:00 until 2026-12-31 23:59/);
+    const [job] = loadJobs();
+    assert.equal(job.nextRunAt, new Date(2026, 9, 1, 9, 0).toISOString());
+
+    assert.match((await call(tools.cronList, {})).content[0].text, /until 2026-12-31 23:59/);
+    assert.match(
+      (await call(tools.cronList, { job: "sprint" })).content[0].text,
+      /window:   from 2026-10-01 00:00 until 2026-12-31 23:59/,
+    );
+
+    await call(tools.cronUpdate, { job: "sprint", endAt: null, startAt: null });
+    assert.equal(loadJobs()[0].endAt, null);
+    assert.equal(loadJobs()[0].startAt, null);
+  });
+
+  it("says so when a window excludes every run", async () => {
+    const r = await call(tools.cronCreate, {
+      name: "never",
+      prompt: "p",
+      schedule: "mon 9:00",
+      startAt: "2026-09-22",
+      endAt: "2026-09-23",
+    });
+    assert.match(r.content[0].text, /no run of that schedule fits the window/);
+    assert.equal(loadJobs()[0].nextRunAt, null);
+    assert.match((await call(tools.cronList, {})).content[0].text, /never .* done ·/);
+  });
+
+  it("rejects a window that makes no sense", async () => {
+    await assert.rejects(
+      call(tools.cronCreate, { name: "bad", prompt: "p", schedule: "every 1h", endAt: "2026-09-01" }),
+      /endAt .* is in the past/,
+    );
+    assert.equal(loadJobs().length, 0);
+  });
+
   it("lists, updates, pauses, runs and deletes", async () => {
     await call(tools.cronCreate, { name: "report", prompt: "p", schedule: "daily 9:00" });
 

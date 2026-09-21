@@ -56,11 +56,32 @@ All times are in local time.
 | `in 30m`, `in 2 hours` | Once, relative |
 | `2026-10-01 09:00` | Once, at a timestamp |
 
+A bare date (`2026-10-01`) means local midnight.
+
+### Start and end
+
+A job can be limited to a window, so it stops on its own instead of being deleted later:
+
+```
+cron_create:
+  name: sprint-report
+  schedule: weekdays 9:00
+  startAt: 2026-10-01
+  endAt: 2026-12-31 23:59
+  prompt: …
+```
+
+- `startAt` — no run before this time. A start in the future re-anchors an interval: `every 2h` with `startAt` 15:30 starts at 15:30, not when it was created. A slot exactly at `startAt` runs.
+- `endAt` — no run after this time; a slot exactly at `endAt` still runs. Afterwards the job shows `done`, keeps its history, and `cron_update` with a later `endAt` wakes it again.
+- Both are local time as `2026-10-01` (midnight) or `2026-10-01 09:00`, or relative (`in 3d`). Without them a job runs forever.
+- `cron_update` clears an end again with `endAt: null`. `/cron add` asks for both, and `Enter` means "no limit".
+- A window that no slot fits (a Monday job from Tuesday to Wednesday) creates a job that will never fire — `cron_create` and `/cron add` say so, and the list shows it as `done`.
+
 ### Tools for the model
 
 | Tool | Purpose |
 |---|---|
-| `cron_create` | Save prompt + schedule + tool allowlist (+ skills, model, cwd, delivery) |
+| `cron_create` | Save prompt + schedule + tool allowlist (+ skills, model, cwd, delivery, run window) |
 | `cron_list` | List jobs, or show one job in full |
 | `cron_update` | Change any field; `enabled: false` pauses, `true` resumes |
 | `cron_delete` | Remove a job (its history stays on disk) |
@@ -90,7 +111,7 @@ All times are in local time.
 | Situation | What happens |
 |---|---|
 | pi is open | Due jobs start within a minute. |
-| pi was closed when a slot came up | At the next start the job runs **once** (`catchUp: true`, the default). With `catchUp: false` the missed slot is skipped. |
+| pi was closed when a slot came up | At the next start the job runs **once** (`catchUp: true`, the default). With `catchUp: false` the missed slot is skipped. Nothing starts after `endAt`: neither such a missed slot nor the repeat of an interrupted run. |
 | You quit pi while a job is running | The run is stopped and recorded as `aborted`, and the job runs again at the next start. |
 | pi crashed or was killed | At the next start the run is recorded as `crashed`, any leftover child process is stopped, and the job runs again. |
 | Several pi windows are open | One of them schedules (lease in `scheduler.json`). If it quits, another open window takes over within a minute. |
