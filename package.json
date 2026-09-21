@@ -1,0 +1,55 @@
+{
+  "name": "@patimweb/pi-cron",
+  "version": "0.1.0",
+  "description": "Scheduled prompts for the pi coding agent: save a prompt + schedule + tool allowlist as a cron job that runs in the background, survives restarts and delivers its result.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cron",
+    "scheduler",
+    "launchd",
+    "automation"
+  ],
+  "author": "Patrick Weppelmann",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Smotherer007/pi-cron.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Smotherer007/pi-cron/issues"
+  },
+  "scripts": {
+    "build": "echo 'No build step defined'",
+    "test": "node --experimental-test-coverage --test 'tests/**/*.test.ts'",
+    "test:watch": "node --test --watch 'tests/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@semantic-release/git": "^10.0.0",
+    "@types/node": "^26.6.2",
+    "semantic-release": "^25.0.0",
+    "typebox": "1.3.27",
+    "typescript": "7.0.2"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/Smotherer007/pi-cron/main/screenshot.png"
+  }
+}

@@ -1,0 +1,96 @@
+/**
+ * Plain data shapes shared by the extension and the background runner.
+ *
+ * Everything here is serialised to JSON on disk (jobs.json, config.json,
+ * runs/*.json), so it contains no classes, no Dates and no functions.
+ */
+
+/** A parsed schedule. `input` keeps what the user typed for display. */
+export type Schedule =
+  | { readonly kind: "cron"; readonly expr: string; readonly input: string }
+  | { readonly kind: "every"; readonly everyMs: number; readonly input: string }
+  | { readonly kind: "once"; readonly at: string; readonly input: string };
+
+/** Where a finished run is reported. The output file is always written. */
+export type DeliveryTarget = "notify" | "telegram" | "webhook";
+
+export type RunStatus = "ok" | "error" | "timeout" | "crashed" | "skipped";
+
+export interface RunningInfo {
+  readonly pid: number;
+  readonly startedAt: string;
+}
+
+export interface CronJob {
+  readonly id: string;
+  readonly name: string;
+  /** The prompt the agent receives when the job fires. */
+  readonly prompt: string;
+  readonly schedule: Schedule;
+  /**
+   * Tool allowlist for the run (`pi --tools`). `null` means pi's default
+   * tool set, an empty array means no tools at all.
+   */
+  readonly tools: readonly string[] | null;
+  /** Extra skills to load (`pi --skill <path>`). */
+  readonly skills: readonly string[];
+  /** Model pattern (`pi --model`), e.g. "sonnet" or "anthropic/claude-x:high". */
+  readonly model: string | null;
+  /** Working directory the agent runs in. */
+  readonly cwd: string;
+  readonly deliver: readonly DeliveryTarget[];
+  readonly enabled: boolean;
+  /** Run a missed slot once after downtime (sleep, reboot) instead of skipping it. */
+  readonly catchUp: boolean;
+  readonly timeoutMinutes: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** ISO timestamp of the next due run, `null` once a one-shot job has fired. */
+  readonly nextRunAt: string | null;
+  readonly lastRunAt: string | null;
+  readonly lastStatus: RunStatus | null;
+  readonly lastOutputPath: string | null;
+  readonly runCount: number;
+  readonly running: RunningInfo | null;
+}
+
+export interface JobsFile {
+  readonly version: 1;
+  readonly jobs: readonly CronJob[];
+}
+
+/** One finished (or skipped) run, stored as runs/<jobId>/<stamp>.json. */
+export interface RunRecord {
+  readonly jobId: string;
+  readonly jobName: string;
+  readonly status: RunStatus;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly durationMs: number;
+  readonly exitCode: number | null;
+  readonly outputPath: string | null;
+  readonly error: string | null;
+  readonly delivery: Readonly<Record<string, string>>;
+}
+
+export interface TelegramConfig {
+  readonly botToken: string;
+  readonly chatId: string;
+}
+
+export interface CronConfig {
+  /** Command that starts pi, e.g. ["/usr/local/bin/node", "/…/pi/dist/cli.js"]. */
+  readonly piCommand: readonly string[];
+  /** Node binary the background runner uses. */
+  readonly nodePath: string;
+  /** PATH handed to runs started by launchd/cron, which start with a bare PATH. */
+  readonly path: string;
+  /** Extra environment variables for every run (API keys etc.). */
+  readonly env: Readonly<Record<string, string>>;
+  readonly telegram: TelegramConfig | null;
+  readonly webhookUrl: string | null;
+  /** Default delivery targets for new jobs. */
+  readonly defaultDeliver: readonly DeliveryTarget[];
+  /** Runs older than this many days are pruned. */
+  readonly keepRunsDays: number;
+}
