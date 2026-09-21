@@ -50,5 +50,8 @@
       "./index.ts"
     ],
     "image": "https://raw.githubusercontent.com/Smotherer007/pi-cron/main/screenshot.png"
+  },
+  "dependencies": {
+    "node-cron": "^4.6.0"
   }
 }

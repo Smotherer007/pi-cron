@@ -3,13 +3,16 @@
  *
  * - Starts with pi, stops with pi. Nothing runs while pi is closed.
  * - First pass right at start (catch-up of missed slots, re-runs of runs that
- *   were cut off), then one pass at every minute boundary.
+ *   were cut off), then one pass every minute, triggered by a node-cron task
+ *   ("* * * * *": an in-process timer, no OS scheduler).
  * - Only the pi holding the lease schedules (lease.ts); others stay idle and
  *   take over if that pi quits.
  * - Runs are child processes of this pi. On quit they are aborted, recorded
  *   as "aborted" and become due again, so they run at the next start.
  */
 
+import cron from "node-cron";
+import type { ScheduledTask } from "node-cron";
 import { executeJob } from "./executor.ts";
 import type { ExecuteResult } from "./executor.ts";
 import { acquireLease, releaseLease } from "./lease.ts";
@@ -27,18 +30,13 @@ export interface SchedulerOptions {
   readonly pid?: number;
 }
 
-/** Milliseconds until the next minute boundary (+1 s so the minute is reached). */
-export function msToNextMinute(now: Date): number {
-  return 60_000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 1000;
-}
-
 export class CronScheduler {
   private readonly opts: SchedulerOptions;
   private readonly pid: number;
   private readonly clock: () => Date;
   private readonly aborter = new AbortController();
   private readonly active = new Map<string, Promise<ExecuteResult | null>>();
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private ticker: ScheduledTask | null = null;
   private stopped = false;
   private leader = false;
 
@@ -57,23 +55,25 @@ export class CronScheduler {
   }
 
   start(): void {
-    if (this.timer || this.stopped) return;
-    this.schedule(0);
+    if (this.ticker || this.stopped) return;
+    this.ticker = cron.schedule("* * * * *", () => this.safeTick(), {
+      name: `pi-cron-${this.pid}`,
+      noOverlap: true,
+      // Never keep pi alive just for the scheduler.
+      unref: true,
+      // After sleep the missed minutes are caught up by our own logic.
+      suppressMissedWarning: true,
+    });
+    // Catch up right away instead of waiting for the next full minute.
+    setImmediate(() => this.safeTick());
   }
 
-  private schedule(delay: number): void {
-    if (this.stopped) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      try {
-        this.tickOnce();
-      } catch (err) {
-        this.opts.onError?.(err);
-      }
-      this.schedule(msToNextMinute(this.clock()));
-    }, delay);
-    // Never keep pi alive just for the scheduler.
-    this.timer.unref?.();
+  private safeTick(): void {
+    try {
+      this.tickOnce();
+    } catch (err) {
+      this.opts.onError?.(err);
+    }
   }
 
   /** One pass: take/renew the lease, then start whatever is due. */
@@ -118,8 +118,8 @@ export class CronScheduler {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
+    await this.ticker?.destroy();
+    this.ticker = null;
     this.aborter.abort();
     await Promise.allSettled([...this.active.values()]);
     try {

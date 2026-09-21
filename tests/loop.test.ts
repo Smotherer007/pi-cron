@@ -6,7 +6,8 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { acquireLease, isLeaseLive, readLease, releaseLease } from "../src/core/lease.ts";
-import { CronScheduler, msToNextMinute } from "../src/core/loop.ts";
+import cron from "node-cron";
+import { CronScheduler } from "../src/core/loop.ts";
 import { mutateJobs, loadJobs, saveConfig, saveJobs } from "../src/core/store.ts";
 import type { ExecuteResult } from "../src/core/executor.ts";
 import type { CronJob } from "../src/core/types.ts";
@@ -28,6 +29,8 @@ beforeEach(() => {
 
 const addJob = (job: CronJob) => mutateJobs((jobs) => ({ jobs: [...jobs, job], result: undefined }));
 const due = (overrides = {}) => makeJob(overrides, undefined, { nextRunAt: new Date(Date.now() - 1000).toISOString() });
+
+const stopLater: CronScheduler[] = [];
 
 function scheduler(onRunFinished?: (r: ExecuteResult) => void, pid = process.pid) {
   return new CronScheduler({ piCommand: [process.execPath, fakePi], onRunFinished, pid });
@@ -54,9 +57,21 @@ describe("lease", () => {
 });
 
 describe("CronScheduler", () => {
-  it("wakes just after each minute boundary", () => {
-    assert.equal(msToNextMinute(local(2026, 9, 21, 12, 0)), 61_000);
-    assert.equal(msToNextMinute(new Date(local(2026, 9, 21, 12, 0).getTime() + 59_500)), 1_500);
+  it("ticks via a node-cron task that is removed on stop", async () => {
+    addJob(due({ name: "hello" }));
+    const done = new Promise<ExecuteResult>((resolve) => {
+      const s = scheduler(resolve);
+      s.start();
+      const mine = [...cron.getTasks().values()].filter((t) => t.name === `pi-cron-${process.pid}`);
+      assert.equal(mine.length, 1);
+      assert.equal(mine[0].getPattern(), "* * * * *");
+      // the first pass runs immediately, not at the next full minute
+      void new Promise((r) => setTimeout(r, 50)).then(() => assert.deepEqual(s.runningJobIds.length, 1));
+      stopLater.push(s);
+    });
+    assert.equal((await done).record?.status, "ok");
+    await stopLater.pop()!.stop();
+    assert.equal([...cron.getTasks().values()].filter((t) => t.name === `pi-cron-${process.pid}`).length, 0);
   });
 
   it("runs due jobs as child pi processes and reports back", async () => {

@@ -4,7 +4,7 @@ Scheduled prompts for the [pi coding agent](https://github.com/earendil-works/pi
 
 A job is **a prompt + a schedule + the tools the run may use**. At the due time a fresh, unattended pi session runs the prompt with exactly those tools, saves the answer, and pi tells you about it.
 
-- **Runs inside pi.** While pi is open, pi-cron checks every minute. There is no background service or daemon, and nothing is installed into your OS. It works the same on macOS, Linux and Windows.
+- **Runs inside pi.** While pi is open, pi-cron checks every minute using [node-cron](https://github.com/node-cron/node-cron), a timer inside the Node process. There is no background service or daemon, and nothing is installed into your OS. It works the same on macOS, Linux and Windows.
 - **Only configuration and history are kept.** Jobs and past runs live in `~/.pi/agent/cron/`. Nothing runs while pi is closed.
 - **Catches up when you come back.** A slot missed while pi was closed runs once at the next start, never once per missed slot. A run that was cut off because pi quit runs again at the next start.
 - **Least-privilege runs.** Each job has its own tool allowlist (`pi --tools`), plus optional skills and model.
@@ -48,7 +48,7 @@ All times are in local time.
 
 | Input | Meaning |
 |---|---|
-| `0 8 * * 1-5` | Cron expression (minute hour day month weekday); `@hourly`, `@daily`, … also work |
+| `0 8 * * 1-5` | Cron expression (minute hour day month weekday), parsed by node-cron. `@daily` etc., `L` (last day), `1#1` (first Monday) and `5L` (last Friday) also work. If day-of-month and weekday are both set, a day matches when either matches (classic cron); a `*` in one of them combines them with AND, as in cronie. |
 | `every 15m`, `every 2 hours`, `every 1d` | Fixed interval (minimum 1 minute) |
 | `daily 9:00`, `every day at 7am` | Every day |
 | `weekdays 8:30`, `weekends 10:00` | Mon–Fri / Sat–Sun |
@@ -112,7 +112,7 @@ For email, give the job an email tool (for example [pi-email](https://github.com
 
 ```
 pi (interactive)
- └─ pi-cron scheduler: at start, then every minute
+ └─ pi-cron scheduler: at start, then every minute (node-cron "* * * * *")
       ├─ scheduler.json: is this pi the one scheduling?
       ├─ jobs.json: which jobs are due? (catch-up, re-runs)
       └─ per due job: child process  pi -p --tools … --session-dir … "<prompt>"

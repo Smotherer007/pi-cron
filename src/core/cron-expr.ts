@@ -1,174 +1,131 @@
 /**
- * Minimal 5-field cron expressions (minute hour day-of-month month day-of-week),
- * evaluated in the machine's local time zone.
+ * Cron expressions via node-cron (pure JavaScript, no OS scheduler involved).
  *
- * Supports `*`, lists (`1,15`), ranges (`1-5`), steps (`*\/15`, `10-50/10`),
- * month and weekday names (`jan`, `mon-fri`), `7` as Sunday, and the macros
- * `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`.
+ * node-cron parses and matches the expression: ranges, steps, lists, names,
+ * macros (@daily …) and its extensions (L, L-n, 15W, LW, 2#3, 5L).
  *
- * Day-of-month and day-of-week follow classic cron semantics: when both are
- * restricted, a day matches if EITHER matches.
+ * Day-of-month and day-of-week keep classic cron semantics: when both are
+ * restricted, a day matches if EITHER matches. node-cron itself ANDs them,
+ * which would silently turn "0 8 1 * mon" from every-Monday-plus-the-1st into
+ * "the 1st, if it happens to be a Monday"; that one case is decided here by
+ * asking the two fields separately.
+ *
+ * pi-cron works per minute, so only 5-field expressions are accepted (no
+ * seconds). What node-cron does not offer is "next run after an arbitrary
+ * date", which pi-cron needs to persist nextRunAt and to catch up missed
+ * slots; nextCronRun walks forward using node-cron's parsed fields to skip
+ * whole months/days/hours and node-cron's own matcher for the final say.
  */
 
-export interface CronFields {
-  readonly minutes: ReadonlySet<number>;
-  readonly hours: ReadonlySet<number>;
-  readonly daysOfMonth: ReadonlySet<number>;
-  readonly months: ReadonlySet<number>;
-  readonly daysOfWeek: ReadonlySet<number>;
-  readonly domRestricted: boolean;
-  readonly dowRestricted: boolean;
-}
-
-const MACROS: Record<string, string> = {
-  "@hourly": "0 * * * *",
-  "@daily": "0 0 * * *",
-  "@midnight": "0 0 * * *",
-  "@weekly": "0 0 * * 0",
-  "@monthly": "0 0 1 * *",
-  "@yearly": "0 0 1 1 *",
-  "@annually": "0 0 1 1 *",
-};
-
-const MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-
-interface FieldSpec {
-  readonly name: string;
-  readonly min: number;
-  readonly max: number;
-  readonly names?: readonly string[];
-  readonly nameOffset?: number;
-}
-
-const FIELDS: readonly FieldSpec[] = [
-  { name: "minute", min: 0, max: 59 },
-  { name: "hour", min: 0, max: 23 },
-  { name: "day-of-month", min: 1, max: 31 },
-  { name: "month", min: 1, max: 12, names: MONTH_NAMES, nameOffset: 1 },
-  { name: "day-of-week", min: 0, max: 7, names: DAY_NAMES, nameOffset: 0 },
-];
-
-function parseValue(raw: string, spec: FieldSpec): number {
-  const lower = raw.toLowerCase();
-  if (spec.names) {
-    const idx = spec.names.indexOf(lower.slice(0, 3));
-    if (idx >= 0 && /^[a-z]+$/.test(lower)) return idx + (spec.nameOffset ?? 0);
-  }
-  if (!/^\d+$/.test(raw)) throw new Error(`Invalid ${spec.name} value "${raw}"`);
-  const n = Number(raw);
-  if (n < spec.min || n > spec.max) {
-    throw new Error(`${spec.name} value ${n} out of range ${spec.min}-${spec.max}`);
-  }
-  return n;
-}
-
-function parseField(raw: string, spec: FieldSpec): Set<number> {
-  const out = new Set<number>();
-  for (const part of raw.split(",")) {
-    if (part === "") throw new Error(`Empty list item in ${spec.name} field`);
-    const [rangePart, stepPart] = part.split("/");
-    let step = 1;
-    if (stepPart !== undefined) {
-      if (!/^\d+$/.test(stepPart) || Number(stepPart) === 0) {
-        throw new Error(`Invalid step "${stepPart}" in ${spec.name} field`);
-      }
-      step = Number(stepPart);
-    }
-    let lo: number;
-    let hi: number;
-    if (rangePart === "*") {
-      lo = spec.min;
-      hi = spec.name === "day-of-week" ? 6 : spec.max;
-    } else if (rangePart.includes("-")) {
-      const [a, b] = rangePart.split("-");
-      lo = parseValue(a, spec);
-      hi = parseValue(b, spec);
-      if (lo > hi) throw new Error(`Invalid range "${rangePart}" in ${spec.name} field`);
-    } else {
-      lo = parseValue(rangePart, spec);
-      hi = stepPart !== undefined ? (spec.name === "day-of-week" ? 6 : spec.max) : lo;
-    }
-    for (let v = lo; v <= hi; v += step) {
-      out.add(spec.name === "day-of-week" && v === 7 ? 0 : v);
-    }
-  }
-  return out;
-}
+import cron from "node-cron";
+import type { ScheduledTask } from "node-cron";
 
 export function normalizeCron(expr: string): string {
-  const trimmed = expr.trim().replace(/\s+/g, " ");
-  return MACROS[trimmed.toLowerCase()] ?? trimmed;
+  return expr.trim().replace(/\s+/g, " ");
+}
+
+function fieldCount(expr: string): number {
+  return expr.startsWith("@") ? 5 : expr.split(" ").length;
+}
+
+/** Why an expression is not usable, or null if it is. */
+export function cronError(expr: string): string | null {
+  const norm = normalizeCron(expr);
+  if (fieldCount(norm) !== 5) {
+    return `Cron expression needs 5 fields (minute hour day month weekday), got ${norm.split(" ").length}: "${expr}"`;
+  }
+  const detail = cron.validateDetailed(norm);
+  if (!detail.valid) return detail.errors.map((e) => e.message).join("; ") || `Invalid cron expression "${expr}"`;
+  return null;
 }
 
 export function isCronExpression(expr: string): boolean {
-  const norm = normalizeCron(expr);
-  if (norm.split(" ").length !== 5) return false;
-  try {
-    parseCron(norm);
-    return true;
-  } catch {
-    return false;
-  }
+  return cronError(expr) === null;
 }
 
-export function parseCron(expr: string): CronFields {
-  const parts = normalizeCron(expr).split(" ");
-  if (parts.length !== 5) {
-    throw new Error(`Cron expression needs 5 fields (minute hour day month weekday), got ${parts.length}: "${expr}"`);
-  }
-  const [mi, h, dom, mo, dow] = parts.map((p, i) => parseField(p, FIELDS[i]));
-  return {
-    minutes: mi,
-    hours: h,
-    daysOfMonth: dom,
-    months: mo,
-    daysOfWeek: dow,
-    domRestricted: parts[2] !== "*",
-    dowRestricted: parts[4] !== "*",
-  };
+export function parseCron(expr: string): ReturnType<typeof cron.parse> {
+  const error = cronError(expr);
+  if (error) throw new Error(error);
+  return cron.parse(normalizeCron(expr));
 }
 
-function dayMatches(f: CronFields, d: Date): boolean {
-  const domOk = f.daysOfMonth.has(d.getDate());
-  const dowOk = f.daysOfWeek.has(d.getDay());
-  if (f.domRestricted && f.dowRestricted) return domOk || dowOk;
-  if (f.domRestricted) return domOk;
-  if (f.dowRestricted) return dowOk;
-  return true;
+// Matchers are never started (no timers); cached because they are reused every tick.
+const matchers = new Map<string, ScheduledTask>();
+
+function matcher(expr: string): ScheduledTask {
+  let task = matchers.get(expr);
+  if (!task) {
+    if (matchers.size > 200) {
+      for (const t of matchers.values()) void t.destroy();
+      matchers.clear();
+    }
+    task = cron.createTask(expr, () => {}, { name: `pi-cron-matcher:${expr}` });
+    matchers.set(expr, task);
+  }
+  return task;
 }
 
 /**
- * First matching minute strictly after `after`. Walks days, then hours, then
- * minutes, so even sparse expressions resolve in a few thousand steps.
+ * How a day matches. node-cron ANDs day-of-month and day-of-week; classic cron
+ * ORs them when both fields are restricted (a field that starts with `*`
+ * counts as unrestricted, as in Vixie cron). Only that case needs the two
+ * fields asked separately; everything else - including L, W and # - stays with
+ * node-cron's own matcher. Macros never restrict both fields and fall through.
+ */
+function dayMatcher(norm: string, task: ScheduledTask): (day: Date) => boolean {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = norm.split(" ");
+  if (!hour || !dayOfMonth || !dayOfWeek || dayOfMonth.startsWith("*") || dayOfWeek.startsWith("*")) {
+    return (day) => task.match(day);
+  }
+  const byDayOfMonth = matcher(`${minute} ${hour} ${dayOfMonth} ${month} *`);
+  const byDayOfWeek = matcher(`${minute} ${hour} * ${month} ${dayOfWeek}`);
+  return (day) => byDayOfMonth.match(day) || byDayOfWeek.match(day);
+}
+
+/**
+ * First matching minute strictly after `after` (local time). Skips months,
+ * days and hours that cannot match, so even sparse expressions resolve fast.
  */
 export function nextCronRun(expr: string, after: Date): Date {
-  const f = parseCron(expr);
+  const norm = normalizeCron(expr);
+  const fields = parseCron(norm);
+  const task = matcher(norm);
+  const matchesDay = dayMatcher(norm, task);
+  const months = new Set(fields.month);
+  const hours = new Set(fields.hour);
+  const minutes = new Set(fields.minute);
+  const firstHour = Math.min(...fields.hour);
+  const firstMinute = Math.min(...fields.minute);
+
   const d = new Date(after.getTime());
   d.setSeconds(0, 0);
   d.setMinutes(d.getMinutes() + 1);
 
   const limit = after.getTime() + 5 * 366 * 24 * 60 * 60 * 1000;
   while (d.getTime() <= limit) {
-    if (!f.months.has(d.getMonth() + 1)) {
+    if (!months.has(d.getMonth() + 1)) {
       d.setMonth(d.getMonth() + 1, 1);
       d.setHours(0, 0, 0, 0);
       continue;
     }
-    if (!dayMatches(f, d)) {
+    // Let node-cron decide whether the day fits (L, W, #), with the classic
+    // OR between day-of-month and day-of-week when both are restricted.
+    const probe = new Date(d.getFullYear(), d.getMonth(), d.getDate(), firstHour, firstMinute, 0, 0);
+    if (!matchesDay(probe)) {
       d.setDate(d.getDate() + 1);
       d.setHours(0, 0, 0, 0);
       continue;
     }
-    if (!f.hours.has(d.getHours())) {
+    if (!hours.has(d.getHours())) {
       d.setHours(d.getHours() + 1, 0, 0, 0);
       continue;
     }
-    if (!f.minutes.has(d.getMinutes())) {
+    if (!minutes.has(d.getMinutes())) {
       d.setMinutes(d.getMinutes() + 1, 0, 0);
       continue;
     }
-    return d;
+    if (matchesDay(d)) return d;
+    d.setMinutes(d.getMinutes() + 1, 0, 0);
   }
   throw new Error(`Cron expression "${expr}" never fires within 5 years`);
 }
