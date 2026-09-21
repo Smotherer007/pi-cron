@@ -31,7 +31,18 @@ export interface RunningInfo {
   readonly childPid?: number;
 }
 
-export interface CronJob {
+/**
+ * Optional limits on when a job may run, as ISO timestamps. `startAt` delays
+ * the first run (a start in the future re-anchors intervals), `endAt` closes
+ * the window: a slot after it never runs and the job ends with
+ * `nextRunAt: null`. `null` means "no limit".
+ */
+export interface RunWindow {
+  readonly startAt: string | null;
+  readonly endAt: string | null;
+}
+
+export interface CronJob extends RunWindow {
   readonly id: string;
   readonly name: string;
   /** The prompt the agent receives when the job fires. */
@@ -55,7 +66,7 @@ export interface CronJob {
   readonly timeoutMinutes: number;
   readonly createdAt: string;
   readonly updatedAt: string;
-  /** ISO timestamp of the next due run, `null` once a one-shot job has fired. */
+  /** ISO timestamp of the next due run, `null` once a one-shot has fired or the window closed. */
   readonly nextRunAt: string | null;
   readonly lastRunAt: string | null;
   readonly lastStatus: RunStatus | null;

@@ -9,9 +9,14 @@
  *
  * Interrupted runs: a job still marked running by a process that no longer
  * exists (pi was killed mid-run) is recorded as crashed and runs again now.
+ *
+ * Windows (`startAt`/`endAt`): a slot outside them never becomes due, and a
+ * run never starts after `endAt` — not even the repeat of an interrupted one.
+ * Once nothing is left inside the window, the job keeps no next run and only
+ * stays for its history.
  */
 
-import { nextRunAfter } from "./schedule.ts";
+import { firstRun, nextRunAfter } from "./schedule.ts";
 import type { CronJob, RunningInfo } from "./types.ts";
 
 export const GRACE_MS = 2 * 60_000;
@@ -36,8 +41,30 @@ export function isProcessAlive(pid: number): boolean {
 
 function advance(job: CronJob, now: Date): string | null {
   const anchor = job.nextRunAt ? new Date(job.nextRunAt) : undefined;
-  const next = nextRunAfter(job.schedule, now, anchor);
+  const next = nextRunAfter(job.schedule, now, anchor, job);
   return next ? next.toISOString() : null;
+}
+
+/**
+ * A window that opened or closed around the stored slot (a stale slot after an
+ * outage, a hand-edited jobs.json, the repeat of an interrupted run): move the
+ * slot into the window, or drop it when the window is gone. `null` means the
+ * slot is fine.
+ */
+function fitWindow(job: CronJob, now: Date): CronJob | null {
+  if (!job.enabled || !job.nextRunAt) return null;
+  const at = new Date(job.nextRunAt).getTime();
+  const start = job.startAt ? new Date(job.startAt).getTime() : null;
+  const end = job.endAt ? new Date(job.endAt).getTime() : null;
+  if (start !== null && at < start) {
+    const first = firstRun(job.schedule, now, job);
+    return { ...job, nextRunAt: first ? first.toISOString() : null };
+  }
+  // The slot lies past the window, or the window closed while it waited. The
+  // last slot may start up to the grace period late, so a slot exactly at
+  // `endAt` still fires.
+  if (end !== null && (at > end || now.getTime() > end + GRACE_MS)) return { ...job, nextRunAt: null };
+  return null;
 }
 
 export function planTick(
@@ -65,6 +92,13 @@ export function planTick(
       const dueNow = !job.nextRunAt || new Date(job.nextRunAt).getTime() > now.getTime();
       job = { ...job, running: null, lastStatus: "crashed", nextRunAt: dueNow ? now.toISOString() : job.nextRunAt };
       crashed.push(job);
+    }
+
+    // Also holds back a repeat whose window has closed meanwhile.
+    const fitted = fitWindow(job, now);
+    if (fitted) {
+      out.push(fitted);
+      continue;
     }
 
     if (!job.enabled || !job.nextRunAt || new Date(job.nextRunAt).getTime() > now.getTime()) {

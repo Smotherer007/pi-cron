@@ -14,9 +14,33 @@ function when(iso: string | null): string {
   return iso ? formatLocal(new Date(iso)) : "-";
 }
 
+/** "active", "paused", "running", or "done": enabled but nothing left to run. */
+export type JobState = "running" | "paused" | "done" | "active";
+
+export function jobState(job: CronJob): JobState {
+  if (job.running) return "running";
+  if (!job.enabled) return "paused";
+  return job.nextRunAt ? "active" : "done";
+}
+
+/** "from 2026-10-01 00:00 until 2026-12-31 23:59", or null without a window. */
+export function windowLabel(job: Pick<CronJob, "startAt" | "endAt">): string | null {
+  const from = job.startAt ? `from ${when(job.startAt)}` : null;
+  const until = job.endAt ? `until ${when(job.endAt)}` : null;
+  const parts = [from ?? (until ? "from now" : null), until].filter((p): p is string => p !== null);
+  return parts.length ? parts.join(" ") : null;
+}
+
 export function formatJobLine(job: CronJob): string {
-  const state = job.running ? "running" : job.enabled ? "active" : "paused";
-  return `• ${job.name} [${job.id}] ${state} · ${describeSchedule(job.schedule)} · next ${when(job.nextRunAt)} · last ${job.lastStatus ?? "-"}`;
+  const window = windowLabel(job);
+  return [
+    `• ${job.name} [${job.id}] ${jobState(job)} · ${describeSchedule(job.schedule)}`,
+    `next ${when(job.nextRunAt)}`,
+    `last ${job.lastStatus ?? "-"}`,
+    window,
+  ]
+    .filter((p): p is string => Boolean(p))
+    .join(" · ");
 }
 
 export function formatJobs(jobs: readonly CronJob[]): string {
@@ -27,8 +51,9 @@ export function formatJobs(jobs: readonly CronJob[]): string {
 export function formatJobDetail(job: CronJob): string {
   return [
     `${job.name} [${job.id}]`,
-    `  status:   ${job.running ? `running (pid ${job.running.pid})` : job.enabled ? "active" : "paused"}`,
+    `  status:   ${jobState(job)}${job.running ? ` (pid ${job.running.pid})` : ""}`,
     `  schedule: ${describeSchedule(job.schedule)}`,
+    windowLabel(job) ? `  window:   ${windowLabel(job)}` : null,
     `  next run: ${when(job.nextRunAt)}`,
     `  last run: ${when(job.lastRunAt)} (${job.lastStatus ?? "-"}), ${job.runCount} run(s)`,
     `  tools:    ${toolsLabel(job.tools)}`,

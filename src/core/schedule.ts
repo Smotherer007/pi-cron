@@ -12,7 +12,7 @@
  */
 
 import { isCronExpression, nextCronRun, normalizeCron } from "./cron-expr.ts";
-import type { Schedule } from "./types.ts";
+import type { RunWindow, Schedule } from "./types.ts";
 
 const MINUTE = 60_000;
 
@@ -69,11 +69,46 @@ function parseDays(text: string): string | null {
   return nums.sort((a, b) => a - b).join(",");
 }
 
-function parseLocalTimestamp(text: string): Date | null {
+/**
+ * "2026-10-01", "2026-10-01 09:00", "2026-10-01T09:00", optionally with `Z` or
+ * an offset. A bare date is local midnight, not UTC midnight. `null` when the
+ * text is not a timestamp at all.
+ */
+export function parseLocalTimestamp(text: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(text.trim());
+  if (!m) return null;
+  const [, year, month, day, hour, minute, second, zone] = m;
+  if (zone) {
+    // "+0200" is not ISO; give it the colon the parser expects.
+    const z = zone.length === 5 ? `${zone.slice(0, 3)}:${zone.slice(3)}` : zone;
+    const abs = new Date(`${year}-${month}-${day}T${hour ?? "00"}:${minute ?? "00"}:${second ?? "00"}${z}`);
+    return Number.isNaN(abs.getTime()) ? null : abs;
+  }
+  const d = new Date(Number(year), Number(month) - 1, Number(day), Number(hour ?? 0), Number(minute ?? 0), Number(second ?? 0));
+  // The Date constructor rolls 2026-02-31 over into March; reject instead.
+  const exact =
+    d.getFullYear() === Number(year) &&
+    d.getMonth() === Number(month) - 1 &&
+    d.getDate() === Number(day) &&
+    d.getHours() === Number(hour ?? 0) &&
+    d.getMinutes() === Number(minute ?? 0);
+  return exact ? d : null;
+}
+
+/**
+ * A point in time for a job's window: a timestamp above, or "in 2h" relative
+ * to `now`. `null` and empty text mean "no limit".
+ */
+export function parseInstant(text: string | null | undefined, now: Date): Date | null {
+  if (text === null || text === undefined) return null;
   const t = text.trim();
-  if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?(Z|[+-]\d{2}:?\d{2})?$/.test(t)) return null;
-  const d = new Date(t.replace(" ", "T"));
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (!t) return null;
+  const rel = /^in\s+(.+)$/i.exec(t);
+  if (rel) {
+    const ms = parseDuration(rel[1]);
+    return ms === null ? null : new Date(now.getTime() + ms);
+  }
+  return parseLocalTimestamp(t);
 }
 
 export function parseSchedule(input: string, now: Date = new Date()): Schedule {
@@ -124,10 +159,47 @@ export function parseSchedule(input: string, now: Date = new Date()): Schedule {
 }
 
 /**
- * Next due time strictly after `after`.
+ * Next due time strictly after `after`, inside the job's window.
  * Intervals keep their phase: the next slot is `anchor + k * every`.
+ * `null` means nothing runs any more: a one-shot that passed, or a slot that
+ * would fall after `endAt`. A slot exactly at `startAt` counts.
  */
-export function nextRunAfter(schedule: Schedule, after: Date, anchor?: Date): Date | null {
+export function nextRunAfter(schedule: Schedule, after: Date, anchor?: Date, window?: Partial<RunWindow> | null): Date | null {
+  const { start, end } = windowBounds(window);
+  let next = nextSlot(schedule, after, anchor);
+  if (next && start && next.getTime() < start.getTime()) {
+    // The window opens later than that slot: take the first slot from there.
+    next = nextSlot(schedule, new Date(start.getTime() - 1000), anchor);
+  }
+  if (next && end && next.getTime() > end.getTime()) return null;
+  return next;
+}
+
+/** First run time for a freshly created job. */
+export function firstRun(schedule: Schedule, now: Date, window?: Partial<RunWindow> | null): Date | null {
+  const { start } = windowBounds(window);
+  // A start in the future is a fresh start: intervals are anchored to it.
+  const anchor = start && start.getTime() > now.getTime() ? start : undefined;
+  return nextRunAfter(schedule, now, anchor, window);
+}
+
+interface WindowBounds {
+  readonly start: Date | null;
+  readonly end: Date | null;
+}
+
+/** Unparsable bounds (a hand-edited jobs.json) count as "no limit". */
+function windowBounds(window?: Partial<RunWindow> | null): WindowBounds {
+  const start = window?.startAt ? new Date(window.startAt) : null;
+  const end = window?.endAt ? new Date(window.endAt) : null;
+  return {
+    start: start && !Number.isNaN(start.getTime()) ? start : null,
+    end: end && !Number.isNaN(end.getTime()) ? end : null,
+  };
+}
+
+/** The next slot of a schedule, ignoring any window. */
+function nextSlot(schedule: Schedule, after: Date, anchor?: Date): Date | null {
   switch (schedule.kind) {
     case "cron":
       return nextCronRun(schedule.expr, after);
@@ -142,13 +214,6 @@ export function nextRunAfter(schedule: Schedule, after: Date, anchor?: Date): Da
       return new Date(base.getTime() + steps * schedule.everyMs);
     }
   }
-}
-
-/** First run time for a freshly created job. */
-export function firstRun(schedule: Schedule, now: Date): Date | null {
-  if (schedule.kind === "once") return new Date(schedule.at);
-  if (schedule.kind === "every") return new Date(now.getTime() + schedule.everyMs);
-  return nextCronRun(schedule.expr, now);
 }
 
 export function describeSchedule(schedule: Schedule): string {
