@@ -1,13 +1,12 @@
 {
   "name": "@patimweb/pi-cron",
   "version": "1.0.0",
-  "description": "Scheduled prompts for the pi coding agent: save a prompt + schedule + tool allowlist as a cron job that runs in the background, survives restarts and delivers its result.",
+  "description": "Scheduled prompts for the pi coding agent: save a prompt + schedule + tool allowlist as a cron job. Runs inside pi on any OS, keeps configuration and run history, catches up missed and interrupted runs.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "cron",
     "scheduler",
-    "launchd",
     "automation"
   ],
   "author": "Patrick Weppelmann",

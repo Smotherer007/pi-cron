@@ -1,18 +1,17 @@
 /**
- * On-disk layout. Everything lives under one directory so it survives pi
- * updates, reboots and reinstalls of the package:
+ * On-disk layout. Only configuration and history live here; the scheduler
+ * itself runs inside pi and keeps no state that must survive a restart:
  *
  *   ~/.pi/agent/cron/
  *     jobs.json              job definitions + scheduling state
- *     config.json            runner settings (pi command, PATH, delivery)
- *     state.json             UI state (which results were already seen)
- *     .lock/                 mutex for jobs.json
+ *     config.json            delivery settings, extra env for runs
+ *     state.json             which results were already seen
+ *     scheduler.json         which open pi process is scheduling (lease)
+ *     .lock/                 mutex for the JSON files
  *     output/<job>/<t>.md    final answer of each run
- *     runs/<job>/<t>.json    run metadata (status, duration, delivery)
+ *     runs/<job>/<t>.json    run history (status, duration, delivery)
  *     logs/<job>/<t>.log     stderr of each run
  *     sessions/<job>/        full pi session of each run
- *     runtime/               copy of the runner the OS scheduler starts
- *     runner.log             output of the OS scheduler itself
  *
  * Override with PI_CRON_HOME (tests) or PI_CODING_AGENT_DIR (pi's own knob).
  */
@@ -38,8 +37,7 @@ export const paths = {
   runsRoot: () => join(cronHome(), "runs"),
   logsDir: (jobId: string) => join(cronHome(), "logs", jobId),
   sessionsDir: (jobId: string) => join(cronHome(), "sessions", jobId),
-  runtime: () => join(cronHome(), "runtime"),
-  runnerLog: () => join(cronHome(), "runner.log"),
+  lease: () => join(cronHome(), "scheduler.json"),
 };
 
 /** Filesystem-safe timestamp, sortable: 2026-09-21T08-00-00-000Z */

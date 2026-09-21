@@ -1,10 +1,13 @@
 /**
- * Runs one job: starts a headless pi (`pi -p`) with the job's prompt, tool
- * allowlist, skills and model, stores the answer, delivers it, and records
- * the result on the job.
+ * Runs one job: starts a headless pi (`pi -p`) as a child of the current pi
+ * with the job's prompt, tool allowlist, skills and model, stores the answer,
+ * delivers it, and records the result on the job and in the run history.
  *
  * Each run is its own pi session (saved under sessions/<job>/), so runs never
- * share context with each other or with an interactive session.
+ * share context with each other or with the interactive session.
+ *
+ * The child lives only as long as the pi that started it: when pi quits, the
+ * run is aborted (signal) and the job is due again at the next start.
  */
 
 import { spawn } from "node:child_process";
@@ -39,58 +42,72 @@ export function buildPiArgs(job: CronJob, now: Date): string[] {
   return args;
 }
 
-export function buildEnv(config: CronConfig): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    // launchd/cron start with a bare PATH; use the one captured at install.
-    PATH: config.path || process.env.PATH,
-    ...config.env,
-    PI_CRON: "1",
-  };
+export function buildEnv(config: CronConfig, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  // PI_CRON tells the child's own pi-cron extension not to schedule anything.
+  return { ...base, ...config.env, PI_CRON: "1" };
 }
 
 interface ProcessResult {
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly timedOut: boolean;
+  readonly aborted: boolean;
   readonly spawnError: string | null;
 }
 
 function runProcess(
   command: readonly string[],
   args: readonly string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; logFile: string },
+  opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    logFile: string;
+    signal?: AbortSignal;
+    onSpawn?: (pid: number) => void;
+  },
 ): Promise<ProcessResult> {
   return new Promise((resolve) => {
     const log = createWriteStream(opts.logFile, { flags: "a" });
     const chunks: Buffer[] = [];
     let timedOut = false;
+    let aborted = false;
     let settled = false;
-    const finish = (r: ProcessResult) => {
+    const finish = (r: Omit<ProcessResult, "timedOut" | "aborted">) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
       // Resolve once stderr is flushed, so the log can be quoted in the output.
-      log.end(() => resolve(r));
+      log.end(() => resolve({ ...r, timedOut, aborted }));
     };
 
     const child = spawn(command[0], [...command.slice(1), ...args], {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
+    const kill = () => {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
+    };
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    if (child.pid) opts.onSpawn?.(child.pid);
     child.stdout.on("data", (c: Buffer) => chunks.push(c));
     child.stderr.on("data", (c: Buffer) => log.write(c));
-    child.on("error", (err) => finish({ exitCode: null, stdout: "", timedOut: false, spawnError: err.message }));
-    child.on("close", (code) =>
-      finish({ exitCode: code, stdout: Buffer.concat(chunks).toString("utf8"), timedOut, spawnError: null }),
-    );
+    child.on("error", (err) => finish({ exitCode: null, stdout: "", spawnError: err.message }));
+    child.on("close", (code) => finish({ exitCode: code, stdout: Buffer.concat(chunks).toString("utf8"), spawnError: null }));
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+      kill();
     }, opts.timeoutMs);
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -114,12 +131,20 @@ function stderrTail(logFile: string, lines = 20): string {
   return tail ? `\n\n\`\`\`\n${tail}\n\`\`\`` : "";
 }
 
+export interface ExecuteOptions {
+  /** How to start pi; config.piCommand wins if set. */
+  readonly piCommand?: readonly string[];
+  /** Aborts the run (pi is quitting). */
+  readonly signal?: AbortSignal;
+  readonly now?: () => Date;
+}
+
 export interface ExecuteResult {
   readonly record: RunRecord | null;
   readonly message: string;
 }
 
-export async function executeJob(jobRef: string, opts: { now?: () => Date } = {}): Promise<ExecuteResult> {
+export async function executeJob(jobRef: string, opts: ExecuteOptions = {}): Promise<ExecuteResult> {
   const clock = opts.now ?? (() => new Date());
   const started = clock();
 
@@ -137,6 +162,7 @@ export async function executeJob(jobRef: string, opts: { now?: () => Date } = {}
   const job = claimed;
 
   const config = loadConfig();
+  const piCommand = config.piCommand.length ? config.piCommand : (opts.piCommand ?? ["pi"]);
   const id = stamp(started);
   for (const dir of [paths.outputDir(job.id), paths.runsDir(job.id), paths.logsDir(job.id), paths.sessionsDir(job.id)]) {
     mkdirSync(dir, { recursive: true });
@@ -146,27 +172,47 @@ export async function executeJob(jobRef: string, opts: { now?: () => Date } = {}
 
   let result: ProcessResult;
   if (!existsSync(job.cwd)) {
-    result = { exitCode: null, stdout: "", timedOut: false, spawnError: `Working directory ${job.cwd} does not exist` };
+    result = { exitCode: null, stdout: "", timedOut: false, aborted: false, spawnError: `Working directory ${job.cwd} does not exist` };
   } else {
-    result = await runProcess(config.piCommand, buildPiArgs(job, started), {
+    result = await runProcess(piCommand, buildPiArgs(job, started), {
       cwd: job.cwd,
       env: buildEnv(config),
       timeoutMs: job.timeoutMinutes * 60_000,
       logFile,
+      signal: opts.signal,
+      onSpawn: (childPid) =>
+        mutateJobs((jobs) => ({
+          jobs: jobs.map((j) => (j.id === job.id && j.running ? { ...j, running: { ...j.running, childPid } } : j)),
+          result: undefined,
+        })),
     });
   }
 
   const finished = clock();
   const durationMs = finished.getTime() - started.getTime();
-  const status: RunStatus = result.timedOut ? "timeout" : result.exitCode === 0 ? "ok" : "error";
+  const status: RunStatus = result.aborted
+    ? "aborted"
+    : result.timedOut
+      ? "timeout"
+      : result.exitCode === 0 && !result.spawnError
+        ? "ok"
+        : "error";
   const error =
-    result.spawnError ??
-    (result.timedOut ? `Timed out after ${job.timeoutMinutes} min` : status === "error" ? `pi exited with code ${result.exitCode}; see ${logFile}` : null);
+    status === "aborted"
+      ? "pi was closed during the run; it runs again at the next start"
+      : (result.spawnError ??
+        (status === "timeout"
+          ? `Timed out after ${job.timeoutMinutes} min`
+          : status === "error"
+            ? `pi exited with code ${result.exitCode}; see ${logFile}`
+            : null));
 
-  const body = status === "ok" ? result.stdout : `${result.stdout}\n\n**Error:** ${error}${stderrTail(logFile)}`;
+  const body = status === "ok" ? result.stdout : `${result.stdout}\n\n**${status}:** ${error}${stderrTail(logFile)}`;
   writeFileSync(outputPath, renderOutput(job, status, started, durationMs, body));
 
-  const delivery = await deliver(job, config, { status, body: result.stdout.trim() || (error ?? ""), outputPath, error });
+  // Nobody is left to read a notification about a run cut short by quitting.
+  const delivery =
+    status === "aborted" ? {} : await deliver(job, config, { status, body: result.stdout.trim() || (error ?? ""), outputPath, error });
 
   const record: RunRecord = {
     jobId: job.id,
@@ -183,20 +229,23 @@ export async function executeJob(jobRef: string, opts: { now?: () => Date } = {}
   writeJsonAtomic(join(paths.runsDir(job.id), `${id}.json`), record);
 
   mutateJobs((jobs) => ({
-    jobs: jobs.map((j) =>
-      j.id !== job.id
-        ? j
-        : {
-            ...j,
-            running: null,
-            lastRunAt: started.toISOString(),
-            lastStatus: status,
-            lastOutputPath: outputPath,
-            runCount: j.runCount + 1,
-            // A one-shot job is done after it ran; keep it (paused) for its history.
-            enabled: j.schedule.kind === "once" && j.nextRunAt === null ? false : j.enabled,
-          },
-    ),
+    jobs: jobs.map((j) => {
+      if (j.id !== job.id) return j;
+      if (status === "aborted") {
+        // Unfinished: due again as soon as a scheduler runs.
+        return { ...j, running: null, lastStatus: status, lastOutputPath: outputPath, nextRunAt: finished.toISOString() };
+      }
+      return {
+        ...j,
+        running: null,
+        lastRunAt: started.toISOString(),
+        lastStatus: status,
+        lastOutputPath: outputPath,
+        runCount: j.runCount + 1,
+        // A one-shot job is done after it ran; keep it (paused) for its history.
+        enabled: j.schedule.kind === "once" && j.nextRunAt === null ? false : j.enabled,
+      };
+    }),
     result: undefined,
   }));
 

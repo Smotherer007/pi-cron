@@ -20,7 +20,7 @@ import { describeSchedule, formatLocal } from "./core/schedule.ts";
 import { findJob, loadConfig, loadJobs, mutateJobs } from "./core/store.ts";
 import type { CronJob, DeliveryTarget } from "./core/types.ts";
 import { formatJobDetail, formatJobs, formatRunLine, toolsLabel } from "./format.ts";
-import { ensureService, startRunNow } from "./setup.ts";
+import { currentScheduler } from "./setup.ts";
 
 type Pi = Pick<ExtensionAPI, "getAllTools">;
 
@@ -63,17 +63,28 @@ const deliverParam = Type.Optional(
 );
 
 export interface ToolDeps {
-  readonly ensureService: typeof ensureService;
-  readonly startRunNow: typeof startRunNow;
+  /** Start a run now in this pi; false if it is already running here. */
+  readonly runNow: (job: CronJob) => boolean;
+  /** Whether this pi is scheduling (false in print mode or inside a run). */
+  readonly schedulerActive: () => boolean;
 }
 
-export function createCronTools(pi: Pi, deps: ToolDeps = { ensureService, startRunNow }) {
+const defaultDeps: ToolDeps = {
+  runNow: (job) => {
+    const s = currentScheduler();
+    if (!s) throw new Error("The pi-cron scheduler is not active in this pi process");
+    return s.runNow(job);
+  },
+  schedulerActive: () => currentScheduler() !== null,
+};
+
+export function createCronTools(pi: Pi, deps: ToolDeps = defaultDeps) {
   const cronCreate = {
     name: "cron_create",
     label: "Create Cron Job",
     description:
       "Save a prompt as a scheduled job. At each due time a fresh, unattended pi session runs the prompt with only the listed tools; " +
-      "the answer is saved and delivered. Jobs persist across restarts and run even when pi is closed.",
+      "the answer is saved and delivered. Jobs are kept across restarts but only run while pi is open; slots missed while pi was closed run once at the next start.",
     promptSnippet: "Schedule a prompt with a tool allowlist as a recurring or one-shot cron job",
     promptGuidelines: [
       "Use cron_create when the user wants something done later or repeatedly (\"every morning\", \"each Friday\", \"in 2 hours\").",
@@ -89,7 +100,7 @@ export function createCronTools(pi: Pi, deps: ToolDeps = { ensureService, startR
       model: Type.Optional(Type.String({ description: "Model pattern for the run, e.g. \"sonnet\"; default is pi's default" })),
       cwd: Type.Optional(Type.String({ description: "Working directory for the run; defaults to the current one" })),
       deliver: deliverParam,
-      catchUp: Type.Optional(Type.Boolean({ description: "Run a missed slot once after sleep/reboot (default true)" })),
+      catchUp: Type.Optional(Type.Boolean({ description: "Run a slot missed while pi was closed once at the next start (default true)" })),
       timeoutMinutes: Type.Optional(Type.Number({ description: "Abort a run after this many minutes (default 30)" })),
     }),
     async execute(
@@ -117,13 +128,9 @@ export function createCronTools(pi: Pi, deps: ToolDeps = { ensureService, startR
         const job = buildJob({ ...params, cwd: params.cwd ?? ctx.cwd }, jobs, now, defaults);
         return { jobs: [...jobs, job], result: job };
       });
-      let note = "";
-      try {
-        const service = deps.ensureService();
-        if (service.installedNow) note = `\nBackground service installed (${service.status.detail}).`;
-      } catch (err) {
-        note = `\nWARNING: the job is saved but the background service could not be installed: ${(err as Error).message}`;
-      }
+      const note = deps.schedulerActive()
+        ? ""
+        : "\nNote: jobs only run while an interactive pi is open; none is scheduling in this process.";
       return text(
         `Created "${job.name}" – ${describeSchedule(job.schedule)}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}, tools: ${toolsLabel(job.tools)}.${note}`,
         { job },
@@ -202,10 +209,8 @@ export function createCronTools(pi: Pi, deps: ToolDeps = { ensureService, startR
     parameters: Type.Object({ job: Type.String({ description: "Job name or id" }) }),
     async execute(_id: string, params: { job: string }) {
       const job = requireJob(loadJobs(), params.job);
-      if (job.running) return text(`"${job.name}" is already running (pid ${job.running.pid}).`, { job });
-      deps.ensureService();
-      const pid = deps.startRunNow(job);
-      return text(`Started "${job.name}" in the background (pid ${pid}). Use cron_results to see the output.`, { job, pid });
+      if (job.running || !deps.runNow(job)) return text(`"${job.name}" is already running.`, { job });
+      return text(`Started "${job.name}" in the background. You get a notice when it finishes; see cron_results.`, { job });
     },
   };
 

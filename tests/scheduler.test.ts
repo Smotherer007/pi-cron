@@ -69,3 +69,11 @@ describe("planTick", () => {
     assert.equal(planTick([job], local(2026, 9, 22), alive).due.length, 0);
   });
 });
+
+describe("orphans", () => {
+  it("reports the child of a crashed run so it can be stopped", () => {
+    const job = makeJob({}, undefined, { running: { pid: 1, startedAt: "x", childPid: 777 } });
+    const plan = planTick([job], local(2026, 9, 21, 12, 30), () => false);
+    assert.deepEqual(plan.orphanPids, [777]);
+  });
+});

@@ -1,40 +1,20 @@
 /**
- * One scheduler tick, started every minute by launchd (macOS) or cron (Linux).
+ * One scheduling pass, run every minute by the scheduler loop inside pi.
  *
- * Under the lock it decides what is due (scheduler.planTick), starts one
- * detached `runner.ts exec <id>` process per due job and records its pid, then
- * returns. The tick itself never waits for a run, so a slow job never delays
- * the others or the next tick.
+ * Under the lock it decides what is due (scheduler.planTick), hands each due
+ * job to `launch` (which starts the run without awaiting it) and records the
+ * owning pid, then returns. A slow job never delays the others or the next tick.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { paths, stamp } from "./paths.ts";
-import { planTick } from "./scheduler.ts";
+import { isProcessAlive, planTick } from "./scheduler.ts";
 import { loadConfig, loadJobs, saveJobs, withLock, writeJsonAtomic } from "./store.ts";
 import type { CronJob, RunRecord, RunStatus } from "./types.ts";
 
+/** Starts a run in the background and returns the pid that owns it. */
 export type Launcher = (job: CronJob) => number;
-
-export function runnerScript(): string {
-  return fileURLToPath(new URL("./runner.ts", import.meta.url));
-}
-
-/** Start `runner.ts exec <id>` detached; returns its pid. */
-export const launchDetached: Launcher = (job) => {
-  mkdirSync(paths.logsDir(job.id), { recursive: true });
-  const out = openSync(join(paths.logsDir(job.id), "runner.log"), "a");
-  const child = spawn(process.execPath, [runnerScript(), "exec", job.id], {
-    detached: true,
-    stdio: ["ignore", out, out],
-    env: process.env,
-  });
-  child.unref();
-  if (!child.pid) throw new Error(`Could not start run for ${job.name}`);
-  return child.pid;
-};
 
 function recordNonRun(job: CronJob, status: RunStatus, now: Date, error: string): void {
   const record: RunRecord = {
@@ -52,13 +32,21 @@ function recordNonRun(job: CronJob, status: RunStatus, now: Date, error: string)
   writeJsonAtomic(join(paths.runsDir(job.id), `${stamp(now)}-${status}.json`), record);
 }
 
+function killQuietly(pid: number): void {
+  try {
+    if (isProcessAlive(pid)) process.kill(pid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+}
+
 export interface TickResult {
   readonly started: string[];
   readonly skipped: string[];
   readonly crashed: string[];
 }
 
-export function tick(now: Date = new Date(), launch: Launcher = launchDetached): TickResult {
+export function tick(now: Date, launch: Launcher): TickResult {
   const plan = withLock(() => {
     const plan = planTick(loadJobs(), now);
     const pids = new Map<string, number>();
@@ -81,7 +69,10 @@ export function tick(now: Date = new Date(), launch: Launcher = launchDetached):
   });
 
   for (const job of plan.skipped) recordNonRun(job, "skipped", now, "Missed while the machine was off or asleep (catchUp disabled)");
-  for (const job of plan.crashed) recordNonRun(job, "crashed", now, "Run process ended without reporting a result");
+  for (const job of plan.crashed) recordNonRun(job, "crashed", now, "pi ended during the run; started again");
+  // A pi killed hard cannot stop its child; do it now so nothing keeps
+  // running without pi.
+  for (const pid of plan.orphanPids) killQuietly(pid);
 
   if (now.getMinutes() === 0) pruneRuns(now, loadConfig().keepRunsDays);
 
@@ -103,7 +94,6 @@ export function pruneRuns(now: Date, days: number): number {
       const dir = join(base, jobDir);
       if (!statSync(dir).isDirectory()) continue;
       for (const file of readdirSync(dir)) {
-        if (file === "runner.log") continue;
         const full = join(dir, file);
         if (statSync(full).mtimeMs < cutoff) {
           rmSync(full, { recursive: true, force: true });

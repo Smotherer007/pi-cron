@@ -8,24 +8,23 @@
  *   /cron pause|resume <job>
  *   /cron remove <job>
  *   /cron results [job]     recent runs (+ latest output for one job)
- *   /cron install|uninstall|status   background service
+ *   /cron status            scheduler state and next run
  *   /cron telegram <botToken> <chatId> | /cron webhook <url>
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { applyPatch, buildJob } from "./core/jobs.ts";
+import { isLeaseLive, readLease } from "./core/lease.ts";
 import { listRuns, markSeen, readOutput } from "./core/runs.ts";
 import { describeSchedule, formatLocal } from "./core/schedule.ts";
-import { status, uninstall } from "./core/service.ts";
 import { findJob, loadConfig, loadJobs, mutateJobs, saveConfig } from "./core/store.ts";
 import type { CronJob } from "./core/types.ts";
 import { formatJobDetail, formatJobs, formatRunLine } from "./format.ts";
-import { ensureService, startRunNow } from "./setup.ts";
+import { currentScheduler } from "./setup.ts";
 import { checkTools } from "./tools.ts";
 
 export const SUBCOMMANDS = [
-  "list", "add", "show", "run", "pause", "resume", "remove", "results",
-  "install", "uninstall", "status", "telegram", "webhook",
+  "list", "add", "show", "run", "pause", "resume", "remove", "results", "status", "telegram", "webhook",
 ] as const;
 
 function show(pi: ExtensionAPI, content: string): void {
@@ -34,8 +33,7 @@ function show(pi: ExtensionAPI, content: string): void {
 
 function jobOrThrow(ref: string | undefined): CronJob {
   if (!ref) throw new Error("Which job? Pass a name or id.");
-  const jobs = loadJobs();
-  const job = findJob(jobs, ref);
+  const job = findJob(loadJobs(), ref);
   if (!job) throw new Error(`No cron job "${ref}"`);
   return job;
 }
@@ -69,16 +67,32 @@ async function addInteractive(pi: ExtensionAPI, ctx: ExtensionCommandContext): P
     const job = buildJob({ name, prompt, schedule, tools, cwd: ctx.cwd }, jobs, now, { deliver: loadConfig().defaultDeliver });
     return { jobs: [...jobs, job], result: job };
   });
-  let note = "";
-  try {
-    if (ensureService().installedNow) note = " · background service installed";
-  } catch (err) {
-    note = ` · WARNING: background service not installed (${(err as Error).message})`;
-  }
   ctx.ui.notify(
-    `Created "${job.name}" – ${describeSchedule(job.schedule)}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}${note}`,
-    note.includes("WARNING") ? "warning" : "info",
+    `Created "${job.name}" – ${describeSchedule(job.schedule)}, first run ${job.nextRunAt ? formatLocal(new Date(job.nextRunAt)) : "-"}`,
+    "info",
   );
+}
+
+export function statusText(now: Date = new Date()): string {
+  const scheduler = currentScheduler();
+  const lease = readLease();
+  const who = !isLeaseLive(lease, now)
+    ? "no pi is scheduling right now"
+    : lease?.pid === process.pid
+      ? "this pi is scheduling"
+      : `another pi (pid ${lease?.pid}) is scheduling`;
+  const jobs = loadJobs();
+  const next = jobs
+    .filter((j) => j.enabled && j.nextRunAt)
+    .sort((a, b) => (a.nextRunAt as string).localeCompare(b.nextRunAt as string))[0];
+  const running = jobs.filter((j) => j.running).map((j) => j.name);
+  return [
+    `Scheduler: ${scheduler ? "active" : "inactive"} in this pi · ${who}`,
+    `Jobs: ${jobs.length} (${jobs.filter((j) => j.enabled).length} active)${running.length ? ` · running: ${running.join(", ")}` : ""}`,
+    next ? `Next: ${next.name} at ${formatLocal(new Date(next.nextRunAt as string))}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export async function handleCron(pi: ExtensionAPI, rawArgs: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -97,9 +111,13 @@ export async function handleCron(pi: ExtensionAPI, rawArgs: string, ctx: Extensi
       return;
     case "run": {
       const job = jobOrThrow(arg);
-      ensureService();
-      const pid = startRunNow(job);
-      ctx.ui.notify(`Started "${job.name}" (pid ${pid}) – /cron results ${job.name}`, "info");
+      const scheduler = currentScheduler();
+      if (!scheduler) throw new Error("The scheduler is not active in this pi");
+      if (job.running || !scheduler.runNow(job)) {
+        ctx.ui.notify(`"${job.name}" is already running`, "warning");
+        return;
+      }
+      ctx.ui.notify(`Started "${job.name}" – you get a notice when it is done`, "info");
       return;
     }
     case "pause":
@@ -129,31 +147,9 @@ export async function handleCron(pi: ExtensionAPI, rawArgs: string, ctx: Extensi
       show(pi, runs.map(formatRunLine).join("\n") + (latest ? `\n\n${readOutput(latest)}` : ""));
       return;
     }
-    case "install": {
-      const r = ensureService();
-      ctx.ui.notify(r.installedNow ? `Installed: ${r.status.detail}` : `Already running: ${r.status.detail}`, "info");
+    case "status":
+      show(pi, statusText());
       return;
-    }
-    case "uninstall": {
-      const ok = await ctx.ui.confirm("Stop the background service?", "Jobs stay saved but will not run until /cron install.");
-      if (!ok) return;
-      ctx.ui.notify(uninstall().detail, "info");
-      return;
-    }
-    case "status": {
-      const s = status();
-      const jobs = loadJobs();
-      const next = jobs
-        .filter((j) => j.enabled && j.nextRunAt)
-        .sort((a, b) => (a.nextRunAt as string).localeCompare(b.nextRunAt as string))[0];
-      show(
-        pi,
-        `Service: ${s.installed ? "running" : "not installed"} (${s.detail})\n` +
-          `Jobs: ${jobs.length} (${jobs.filter((j) => j.enabled).length} active)` +
-          (next ? `\nNext: ${next.name} at ${formatLocal(new Date(next.nextRunAt as string))}` : ""),
-      );
-      return;
-    }
     case "telegram": {
       const [botToken, chatId] = rest;
       if (!botToken || !chatId) throw new Error("Usage: /cron telegram <botToken> <chatId>");

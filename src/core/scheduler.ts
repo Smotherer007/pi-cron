@@ -3,9 +3,12 @@
  * processes or files: given all jobs and "now", which jobs start, which
  * missed slots are skipped, and which runs died without reporting back.
  *
- * Missed runs (machine asleep, rebooted, logged out): a recurring job whose
- * slot passed more than GRACE_MS ago runs ONCE if `catchUp` is set, never once
- * per missed slot, and is otherwise skipped to its next slot.
+ * Missed slots (pi was closed, machine asleep): a recurring job whose slot
+ * passed more than GRACE_MS ago runs ONCE if `catchUp` is set, never once per
+ * missed slot, and is otherwise skipped to its next slot.
+ *
+ * Interrupted runs: a job still marked running by a process that no longer
+ * exists (pi was killed mid-run) is recorded as crashed and runs again now.
  */
 
 import { nextRunAfter } from "./schedule.ts";
@@ -18,6 +21,8 @@ export interface TickPlan {
   readonly due: CronJob[];
   readonly skipped: CronJob[];
   readonly crashed: CronJob[];
+  /** Children of crashed runs that may still be alive as orphans. */
+  readonly orphanPids: number[];
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -45,6 +50,7 @@ export function planTick(
   const due: CronJob[] = [];
   const skipped: CronJob[] = [];
   const crashed: CronJob[] = [];
+  const orphanPids: number[] = [];
 
   for (const original of jobs) {
     let job = original;
@@ -54,7 +60,10 @@ export function planTick(
         out.push(job);
         continue;
       }
-      job = { ...job, running: null, lastStatus: "crashed" };
+      if (job.running.childPid) orphanPids.push(job.running.childPid);
+      // Run it again right away; a one-shot gets its slot back.
+      const dueNow = !job.nextRunAt || new Date(job.nextRunAt).getTime() > now.getTime();
+      job = { ...job, running: null, lastStatus: "crashed", nextRunAt: dueNow ? now.toISOString() : job.nextRunAt };
       crashed.push(job);
     }
 
@@ -78,5 +87,5 @@ export function planTick(
     out.push(job);
   }
 
-  return { jobs: out, due, skipped, crashed };
+  return { jobs: out, due, skipped, crashed, orphanPids };
 }

@@ -2,7 +2,8 @@
  * Delivery of a finished run. The Markdown output file is always written by
  * the executor; these are the extra channels a job can opt into:
  *
- *   notify    desktop notification (macOS: osascript, Linux: notify-send)
+ *   notify    desktop notification (macOS: osascript, Linux: notify-send,
+ *             Windows: PowerShell tray balloon)
  *   telegram  message via a bot (config.telegram)
  *   webhook   JSON POST to config.webhookUrl
  *
@@ -31,7 +32,7 @@ const defaultDeps: DeliveryDeps = {
   fetch: (...a) => fetch(...a),
   run: (cmd, args) =>
     new Promise((resolve, reject) =>
-      execFile(cmd, args, { timeout: 15_000 }, (err) => (err ? reject(err) : resolve())),
+      execFile(cmd, args, { timeout: 20_000, windowsHide: true }, (err) => (err ? reject(err) : resolve())),
     ),
   platform: process.platform,
 };
@@ -51,11 +52,32 @@ function osa(text: string): string {
   return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+/** PowerShell single-quoted string literal. */
+function ps(text: string): string {
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+/** Tray balloon via Windows Forms: available on every Windows without modules. */
+export function windowsBalloon(heading: string, text: string): string {
+  return [
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "Add-Type -AssemblyName System.Drawing",
+    "$n = New-Object System.Windows.Forms.NotifyIcon",
+    "$n.Icon = [System.Drawing.SystemIcons]::Information",
+    "$n.Visible = $true",
+    `$n.ShowBalloonTip(10000, ${ps(heading)}, ${ps(text)}, 'Info')`,
+    "Start-Sleep -Seconds 10",
+    "$n.Dispose()",
+  ].join("; ");
+}
+
 async function notify(job: CronJob, p: DeliveryPayload, deps: DeliveryDeps): Promise<void> {
   const text = truncate(p.body.replace(/\s+/g, " ").trim() || p.status, 200);
   if (deps.platform === "darwin") {
     await deps.run("osascript", ["-e", `display notification ${osa(text)} with title ${osa(title(job, p.status))}`]);
-  } else if (deps.platform === "linux") {
+  } else if (deps.platform === "win32") {
+    await deps.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", windowsBalloon(title(job, p.status), text)]);
+  } else if (deps.platform !== "android") {
     await deps.run("notify-send", [title(job, p.status), text]);
   } else {
     throw new Error(`notifications not supported on ${deps.platform}`);
@@ -63,8 +85,8 @@ async function notify(job: CronJob, p: DeliveryPayload, deps: DeliveryDeps): Pro
 }
 
 async function telegram(job: CronJob, p: DeliveryPayload, config: CronConfig, deps: DeliveryDeps): Promise<void> {
-  if (!config.telegram) throw new Error("telegram not configured (cron_config / config.json)");
-  const text = truncate(`*${title(job, p.status)}*\n\n${p.body}`, TELEGRAM_LIMIT);
+  if (!config.telegram) throw new Error("telegram not configured (/cron telegram <botToken> <chatId>)");
+  const text = truncate(`${title(job, p.status)}\n\n${p.body}`, TELEGRAM_LIMIT);
   const res = await deps.fetch(`https://api.telegram.org/bot${config.telegram.botToken}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },

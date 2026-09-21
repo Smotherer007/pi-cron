@@ -4,7 +4,7 @@
  * Writes are atomic (write temp file, rename) so a crash or a reboot in the
  * middle of a write never leaves a half-written file. Read-modify-write cycles
  * go through `mutateJobs`, which holds a directory lock: the extension (inside
- * pi) and the background runner may touch jobs.json at the same time.
+ * pi), running jobs and other open pi windows may touch jobs.json at once.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -23,7 +23,21 @@ export function writeJsonAtomic(file: string, data: unknown): void {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, file);
+  // Windows refuses to replace a file another process is reading at that
+  // instant (EPERM/EBUSY); such a reader is always done within milliseconds.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, file);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 20 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) {
+        rmSync(tmp, { force: true });
+        throw err;
+      }
+      sleepSync(25);
+    }
+  }
 }
 
 export function readJson<T>(file: string, fallback: T): T {
@@ -44,7 +58,7 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Directory-based mutex; mkdir is atomic on every filesystem we care about. */
+/** Directory-based mutex; mkdir is atomic on every OS and filesystem. */
 export function withLock<T>(fn: () => T): T {
   ensureHome();
   const lock = paths.lock();
@@ -94,13 +108,11 @@ export function mutateJobs<T>(fn: (jobs: CronJob[]) => { jobs: CronJob[]; result
 }
 
 export const DEFAULT_CONFIG: CronConfig = {
-  piCommand: ["pi"],
-  nodePath: "node",
-  path: "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+  piCommand: [],
   env: {},
   telegram: null,
   webhookUrl: null,
-  defaultDeliver: ["notify"],
+  defaultDeliver: [],
   keepRunsDays: 30,
 };
 

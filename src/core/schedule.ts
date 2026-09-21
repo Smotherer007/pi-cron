@@ -1,6 +1,6 @@
 /**
  * Turns what a user (or the model) types into a Schedule, and computes the
- * next run time. All times are local to the machine the runner lives on.
+ * next run time. All times are local to the machine pi runs on.
  *
  * Accepted input:
  *   - cron:        "0 9 * * 1-5", "@daily"
@@ -89,7 +89,7 @@ export function parseSchedule(input: string, now: Date = new Date()): Schedule {
   if (every) {
     const ms = parseDuration(every[1]) ?? parseDuration(`1 ${every[1]}`);
     if (ms !== null) {
-      if (ms < MINUTE) throw new Error("Intervals shorter than 1 minute are not supported (the runner ticks once a minute)");
+      if (ms < MINUTE) throw new Error("Intervals shorter than 1 minute are not supported (pi-cron checks once a minute)");
       return { kind: "every", everyMs: ms, input: raw };
     }
   }

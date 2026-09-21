@@ -1,102 +1,102 @@
 /**
- * Glue between the running pi process and the background service: works out
- * how to start pi and node outside of pi, installs the OS tick on first use,
- * keeps the runtime copy in sync with the package version, and starts
- * one-off runs.
+ * Glue between pi and the scheduler: how to start a headless pi for a run,
+ * and the one scheduler instance per pi process.
+ *
+ * The instance is kept on globalThis so it survives /reload and session
+ * switches (/new, /resume, /fork) without aborting runs; it is stopped only
+ * when pi quits.
  */
 
-import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
-import { basename, delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { paths } from "./core/paths.ts";
-import { install, runtimeVersion, status, syncRuntime } from "./core/service.ts";
-import type { ServiceStatus } from "./core/service.ts";
-import { loadConfig } from "./core/store.ts";
-import type { CronJob } from "./core/types.ts";
-
-const MIN_NODE_MAJOR = 22;
-
-export function packageVersion(): string {
-  try {
-    const pkg = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    return (JSON.parse(readFileSync(pkg, "utf8")) as { version?: string }).version ?? "dev";
-  } catch {
-    return "dev";
-  }
-}
+import { accessSync, constants, existsSync, realpathSync } from "node:fs";
+import { basename, delimiter, join } from "node:path";
+import { CronScheduler } from "./core/loop.ts";
+import type { SchedulerOptions } from "./core/loop.ts";
 
 function isExecutable(file: string): boolean {
   try {
-    accessSync(file, constants.X_OK);
+    accessSync(file, process.platform === "win32" ? constants.F_OK : constants.X_OK);
     return true;
   } catch {
     return false;
   }
 }
 
-export function which(name: string, pathEnv: string = process.env.PATH ?? ""): string | null {
-  for (const dir of pathEnv.split(delimiter)) {
+/** Minimal cross-platform `which` (honours PATHEXT on Windows). */
+export function which(
+  name: string,
+  pathEnv: string = process.env.PATH ?? process.env.Path ?? "",
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const exts =
+    platform === "win32" ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";").map((e) => e.toLowerCase())] : [""];
+  for (const dir of pathEnv.split(platform === "win32" ? ";" : delimiter)) {
     if (!dir) continue;
-    const full = join(dir, name);
-    if (existsSync(full) && isExecutable(full)) return full;
+    for (const ext of exts) {
+      const full = join(dir, name + ext);
+      if (existsSync(full) && isExecutable(full)) return full;
+    }
   }
   return null;
 }
 
-function isNode(execPath: string): boolean {
-  return /^node(\d+)?(\.exe)?$/.test(basename(execPath));
+export function isNodeBinary(execPath: string): boolean {
+  // Both separators: a Windows execPath is also recognised when the check runs
+  // on macOS or Linux, where node:path would not split on a backslash.
+  return /^node(\d+)?(\.exe)?$/i.test(basename(execPath.replaceAll("\\", "/")));
 }
 
 /**
- * How to start pi from launchd/cron. When pi runs on Node, reuse exactly this
- * interpreter and CLI script, which survives nvm/fnm shims not being on the
- * service PATH. A compiled pi binary is its own interpreter.
+ * How to start a headless pi: the very pi that is running, i.e. this Node and
+ * this CLI script. That works on every OS and needs no `pi` shim on PATH
+ * (pi.cmd on Windows, nvm/fnm shims). A compiled pi binary is its own
+ * interpreter.
  */
 export function detectPiCommand(execPath = process.execPath, argv1 = process.argv[1]): string[] {
-  if (isNode(execPath) && argv1 && existsSync(argv1)) return [execPath, realpathSync(argv1)];
-  if (!isNode(execPath)) return [execPath];
+  if (isNodeBinary(execPath) && argv1 && existsSync(argv1)) return [execPath, realpathSync(argv1)];
+  if (!isNodeBinary(execPath)) return [execPath];
   const pi = which("pi");
   return pi ? [pi] : ["pi"];
 }
 
-/** A Node that can run .ts files natively (type stripping, Node >= 22.18). */
-export function detectNode(execPath = process.execPath): string {
-  if (isNode(execPath) && Number(process.versions.node.split(".")[0]) >= MIN_NODE_MAJOR) return execPath;
-  const node = which("node");
-  if (!node) throw new Error("No `node` found on PATH; pi-cron's background runner needs Node >= 22.18");
-  return node;
+const KEY = Symbol.for("pi-cron.scheduler");
+const NOTIFY = Symbol.for("pi-cron.notify");
+type Notify = (message: string, level: "info" | "warning" | "error") => void;
+type Holder = { [KEY]?: CronScheduler; [NOTIFY]?: Notify };
+
+/**
+ * Where finished-run notices go: the UI of the current session. Updated on
+ * every session start, so it follows /new and /resume.
+ */
+export function setNotifier(fn: Notify | undefined): void {
+  (globalThis as Holder)[NOTIFY] = fn;
 }
 
-export function ensureService(): { status: ServiceStatus; installedNow: boolean } {
-  const current = status();
-  const version = packageVersion();
-  if (current.installed) {
-    if (runtimeVersion() !== version) syncRuntime(undefined, version);
-    return { status: current, installedNow: false };
+export function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
+  try {
+    (globalThis as Holder)[NOTIFY]?.(message, level);
+  } catch {
+    // a stale UI must never break the scheduler
   }
-  const result = install({
-    piCommand: detectPiCommand(),
-    nodePath: detectNode(),
-    path: process.env.PATH ?? "",
-    version,
-  });
-  return { status: result, installedNow: true };
 }
 
-/** Start a job right now in the background, independent of its schedule. */
-export function startRunNow(job: CronJob): number {
-  const version = packageVersion();
-  if (runtimeVersion() !== version) syncRuntime(undefined, version);
-  const config = loadConfig();
-  const nodePath = config.nodePath !== "node" ? config.nodePath : detectNode();
-  mkdirSync(paths.logsDir(job.id), { recursive: true });
-  const out = openSync(join(paths.logsDir(job.id), "runner.log"), "a");
-  const child = spawn(nodePath, [join(paths.runtime(), "runner.ts"), "exec", job.id], {
-    detached: true,
-    stdio: ["ignore", out, out],
-    env: { ...process.env, PATH: config.path || process.env.PATH },
-  });
-  child.unref();
-  return child.pid ?? 0;
+export function currentScheduler(): CronScheduler | null {
+  return (globalThis as Holder)[KEY] ?? null;
+}
+
+/** Start the scheduler for this pi process (idempotent). */
+export function startScheduler(opts: Omit<SchedulerOptions, "piCommand"> & { piCommand?: readonly string[] }): CronScheduler {
+  const existing = currentScheduler();
+  if (existing) return existing;
+  const scheduler = new CronScheduler({ ...opts, piCommand: opts.piCommand ?? detectPiCommand() });
+  (globalThis as Holder)[KEY] = scheduler;
+  scheduler.start();
+  return scheduler;
+}
+
+/** Stop it when pi quits: aborts runs (they re-run next start), releases the lease. */
+export async function stopScheduler(): Promise<void> {
+  const scheduler = currentScheduler();
+  if (!scheduler) return;
+  delete (globalThis as Holder)[KEY];
+  await scheduler.stop();
 }

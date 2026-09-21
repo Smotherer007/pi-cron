@@ -1,8 +1,10 @@
 /**
- * Plain data shapes shared by the extension and the background runner.
+ * Plain data shapes shared by the extension, the scheduler and the executor.
  *
  * Everything here is serialised to JSON on disk (jobs.json, config.json,
  * runs/*.json), so it contains no classes, no Dates and no functions.
+ * Only configuration and history are persisted; the scheduler itself lives in
+ * the running pi process.
  */
 
 /** A parsed schedule. `input` keeps what the user typed for display. */
@@ -14,11 +16,19 @@ export type Schedule =
 /** Where a finished run is reported. The output file is always written. */
 export type DeliveryTarget = "notify" | "telegram" | "webhook";
 
-export type RunStatus = "ok" | "error" | "timeout" | "crashed" | "skipped";
+/**
+ * ok/error/timeout: the run finished. aborted: pi was closed mid-run.
+ * crashed: pi died mid-run without cleaning up. Both of the latter re-run on
+ * the next start. skipped: a missed slot with catchUp disabled.
+ */
+export type RunStatus = "ok" | "error" | "timeout" | "aborted" | "crashed" | "skipped";
 
 export interface RunningInfo {
+  /** The pi process that owns the run. */
   readonly pid: number;
   readonly startedAt: string;
+  /** The headless pi child doing the work (to clean up if the owner died). */
+  readonly childPid?: number;
 }
 
 export interface CronJob {
@@ -79,12 +89,11 @@ export interface TelegramConfig {
 }
 
 export interface CronConfig {
-  /** Command that starts pi, e.g. ["/usr/local/bin/node", "/…/pi/dist/cli.js"]. */
+  /**
+   * Command that starts a headless pi for a run. Empty = the same pi that is
+   * running the scheduler (detected at runtime).
+   */
   readonly piCommand: readonly string[];
-  /** Node binary the background runner uses. */
-  readonly nodePath: string;
-  /** PATH handed to runs started by launchd/cron, which start with a bare PATH. */
-  readonly path: string;
   /** Extra environment variables for every run (API keys etc.). */
   readonly env: Readonly<Record<string, string>>;
   readonly telegram: TelegramConfig | null;

@@ -2,12 +2,13 @@
 
 Scheduled prompts for the [pi coding agent](https://github.com/earendil-works/pi), modelled on [Hermes Agent's cron jobs](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron).
 
-A job is **a prompt + a schedule + the tools the run may use**. At the due time a fresh, unattended pi session runs the prompt with exactly those tools. The answer is saved as Markdown, and you can also get it as a desktop notification, a Telegram message or a webhook call.
+A job is **a prompt + a schedule + the tools the run may use**. At the due time a fresh, unattended pi session runs the prompt with exactly those tools, saves the answer, and pi tells you about it.
 
-- **Runs even when pi is closed.** A small OS service (launchd on macOS, cron on Linux) checks every minute.
-- **Survives restarts.** Jobs live in `~/.pi/agent/cron/jobs.json`. Missed runs after sleep or a reboot are caught up **once**, never once per missed slot.
+- **Runs inside pi.** While pi is open, pi-cron checks every minute. There is no background service or daemon, and nothing is installed into your OS. It works the same on macOS, Linux and Windows.
+- **Only configuration and history are kept.** Jobs and past runs live in `~/.pi/agent/cron/`. Nothing runs while pi is closed.
+- **Catches up when you come back.** A slot missed while pi was closed runs once at the next start, never once per missed slot. A run that was cut off because pi quit runs again at the next start.
 - **Least-privilege runs.** Each job has its own tool allowlist (`pi --tools`), plus optional skills and model.
-- **Isolated sessions.** Every run is its own pi session with no memory of your chat. The full transcript is kept for debugging.
+- **Isolated sessions.** Every run is its own headless pi session with no memory of your chat. The full transcript is kept.
 
 ![pi-cron](screenshot.png)
 
@@ -20,13 +21,11 @@ pi install npm:@patimweb/pi-cron
 pi install /path/to/pi-cron
 ```
 
-Requires **Node.js 26** (the background runner executes TypeScript natively). The OS service is installed automatically when you create your first job. You can also install it yourself with `/cron install`.
-
 ## Usage
 
 Tell the agent what you want:
 
-> Every weekday at 8:00 check my inbox with email_fetch and send me a summary of what needs an answer today with email_send.
+> Every weekday at 8:00 check my inbox with email_fetch and summarise what needs an answer today.
 
 The agent calls `cron_create`:
 
@@ -34,16 +33,18 @@ The agent calls `cron_create`:
 cron_create:
   name: morning-inbox
   schedule: weekdays 8:00
-  tools: ["email_fetch", "email_send"]
-  prompt: Fetch the unread emails in INBOX from the last 24 hours, pick the ones that need
-          an answer today, and email a short prioritised summary to me@example.com.
+  tools: ["email_fetch"]
+  prompt: Fetch the unread emails in INBOX from the last 24 hours and list the ones that
+          need an answer today, most urgent first, one line each.
 ```
 
 Or create the job yourself with `/cron add`.
 
+When a run finishes, pi shows a notice (`pi-cron: morning-inbox finished – /cron results morning-inbox`).
+
 ### Schedules
 
-All times are in the machine's local time.
+All times are in local time.
 
 | Input | Meaning |
 |---|---|
@@ -62,11 +63,11 @@ All times are in the machine's local time.
 | `cron_create` | Save prompt + schedule + tool allowlist (+ skills, model, cwd, delivery) |
 | `cron_list` | List jobs, or show one job in full |
 | `cron_update` | Change any field; `enabled: false` pauses, `true` resumes |
-| `cron_delete` | Remove a job (its output history stays on disk) |
+| `cron_delete` | Remove a job (its history stays on disk) |
 | `cron_run` | Run a job now in the background |
 | `cron_results` | Recent runs and the latest output |
 
-`tools` is the allowlist for the run. Leave it out to use pi's default tools, or pass `[]` for no tools. Tool names are checked against the tools pi knows, so a typo fails when you create the job, not at 3 am.
+`tools` is the allowlist for the run. Leave it out to use pi's default tools, or pass `[]` for no tools. Tool names are checked against the tools pi knows, so a typo fails when you create the job, not when it runs.
 
 ### /cron command
 
@@ -79,21 +80,29 @@ All times are in the machine's local time.
 /cron resume <job>           resume (no backlog of missed runs)
 /cron remove <job>
 /cron results [job]          recent runs (+ latest output of one job)
-/cron status                 service state and next run
-/cron install | uninstall    background service
+/cron status                 who is scheduling, running jobs, next run
 /cron telegram <botToken> <chatId>
 /cron webhook <url>
 ```
 
-When you start pi, it tells you how many new results arrived while you were away.
+## When jobs run
+
+| Situation | What happens |
+|---|---|
+| pi is open | Due jobs start within a minute. |
+| pi was closed when a slot came up | At the next start the job runs **once** (`catchUp: true`, the default). With `catchUp: false` the missed slot is skipped. |
+| You quit pi while a job is running | The run is stopped and recorded as `aborted`, and the job runs again at the next start. |
+| pi crashed or was killed | At the next start the run is recorded as `crashed`, any leftover child process is stopped, and the job runs again. |
+| Several pi windows are open | One of them schedules (lease in `scheduler.json`). If it quits, another open window takes over within a minute. |
+| `pi -p` / non-interactive pi | Does not schedule. Only a pi with a UI runs jobs. |
 
 ## Delivery
 
-The output file is always written. A job's `deliver` list adds more channels:
+Every run writes a Markdown file and shows a notice in pi. A job's `deliver` list adds more channels:
 
 | Target | What happens |
 |---|---|
-| `notify` | Desktop notification (macOS `osascript`, Linux `notify-send`). This is the default for new jobs. |
+| `notify` | Desktop notification (macOS `osascript`, Linux `notify-send`, Windows tray balloon) |
 | `telegram` | Message from your bot. Set it up with `/cron telegram <botToken> <chatId>` |
 | `webhook` | JSON `POST` with job, status and output. Set it up with `/cron webhook <url>` |
 
@@ -102,19 +111,19 @@ For email, give the job an email tool (for example [pi-email](https://github.com
 ## How it works
 
 ```
-launchd / cron ── every 60s ──> node ~/.pi/agent/cron/runtime/runner.ts tick
-                                   │  lock jobs.json, find due jobs, advance nextRunAt
-                                   └─> node runner.ts exec <job>   (detached, one per job)
-                                          └─> pi -p --tools … --session-dir … "<prompt>"
-                                                 ├─ output/<job>/<time>.md
-                                                 ├─ runs/<job>/<time>.json
-                                                 └─ notify / telegram / webhook
+pi (interactive)
+ └─ pi-cron scheduler: at start, then every minute
+      ├─ scheduler.json: is this pi the one scheduling?
+      ├─ jobs.json: which jobs are due? (catch-up, re-runs)
+      └─ per due job: child process  pi -p --tools … --session-dir … "<prompt>"
+           ├─ output/<job>/<time>.md
+           ├─ runs/<job>/<time>.json
+           └─ notice in pi (+ notify / telegram / webhook)
 ```
 
-- The tick only decides and starts runs, so a slow job never delays the others.
-- A job that is still running is not started twice. A run whose process died is marked `crashed`.
+- A run never blocks pi or the other jobs. Each job runs at most once at a time.
 - Each run has a timeout (default 30 min). pi is stopped with SIGTERM, then SIGKILL.
-- The service runs a copy of `src/core/` in `~/.pi/agent/cron/runtime/`, because Node does not strip TypeScript inside `node_modules`. The copy is refreshed automatically after package updates.
+- Runs use the same pi that is running (same Node, same CLI), so no `pi` shim needs to be on PATH.
 - Outputs, logs and sessions older than `keepRunsDays` (default 30) are removed.
 
 ### Files
@@ -122,39 +131,29 @@ launchd / cron ── every 60s ──> node ~/.pi/agent/cron/runtime/runner.ts 
 ```
 ~/.pi/agent/cron/
   jobs.json            job definitions and scheduling state
-  config.json          pi command, PATH, env, telegram, webhook, defaults
+  config.json          delivery settings, extra env, retention
+  state.json           which results you have already seen
+  scheduler.json       which open pi is scheduling
   output/<job>/*.md    answers
-  runs/<job>/*.json    run metadata
+  runs/<job>/*.json    run history
   logs/<job>/*.log     pi stderr per run
   sessions/<job>/      full pi sessions
-  runtime/             runner used by the OS service
-  runner.log           service log
 ```
 
 ### config.json
 
-These values are written by `/cron install`. You can edit them by hand:
-
 ```json
 {
-  "piCommand": ["/usr/local/bin/node", "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"],
-  "nodePath": "/usr/local/bin/node",
-  "path": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-  "env": { "ANTHROPIC_API_KEY": "…" },
+  "piCommand": [],
+  "env": {},
   "telegram": { "botToken": "…", "chatId": "…" },
   "webhookUrl": null,
-  "defaultDeliver": ["notify"],
+  "defaultDeliver": [],
   "keepRunsDays": 30
 }
 ```
 
-`env` is only needed if pi gets its API keys from shell variables. Logins made with `/login` are stored by pi itself and work as they are.
-
-## Notes
-
-- **macOS privacy:** if a job works in `~/Documents`, `~/Desktop` or `~/Downloads`, macOS may ask once whether `node` is allowed to access that folder. You can also grant access under *System Settings → Privacy & Security → Files and Folders*.
-- The service only runs while you are logged in (LaunchAgent). Runs missed while the Mac was asleep or off are caught up after it wakes up or you log in. To skip them instead, set `catchUp: false`.
-- Stop everything with `/cron uninstall`. Your jobs are kept.
+`piCommand` is empty by default, which means runs use the same pi as the one that is running. `env` adds environment variables to every run.
 
 ## Development
 

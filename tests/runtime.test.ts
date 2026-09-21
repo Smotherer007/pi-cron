@@ -1,6 +1,6 @@
 /**
- * End-to-end through the real files: store, tick (spawning the real runner in
- * a detached process), executor (spawning a fake pi), outputs and run records.
+ * End-to-end through the real files: store, tick, executor (spawning a fake
+ * pi), outputs and run history.
  */
 import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +24,7 @@ before(() => {
 after(() => home.cleanup());
 beforeEach(() => {
   saveJobs([]);
-  saveConfig({ piCommand: [process.execPath, fakePi], path: process.env.PATH ?? "", defaultDeliver: [] });
+  saveConfig({ piCommand: [process.execPath, fakePi], defaultDeliver: [] });
 });
 
 function addJob(job: CronJob): void {
@@ -107,13 +107,34 @@ describe("executeJob", () => {
     assert.match(r.record?.error ?? "", /code 3/);
     const log = r.record!.error!.split("see ")[1];
     assert.match(readFileSync(log, "utf8"), /boom/);
-    assert.match(readOutput(r.record!), /\*\*Error:\*\*[\s\S]*boom/);
+    assert.match(readOutput(r.record!), /\*\*error:\*\*[\s\S]*boom/);
   });
 
   it("times out hanging runs", async () => {
     addJob(makeJob({ name: "slow", prompt: "hang", timeoutMinutes: 1 }, undefined, { timeoutMinutes: 0.02 }));
     const r = await executeJob("slow");
     assert.equal(r.record?.status, "timeout");
+  });
+
+  it("aborts when pi quits and makes the job due again", async () => {
+    addJob(makeJob({ name: "cut", prompt: "hang" }));
+    const ac = new AbortController();
+    const run = executeJob("cut", { signal: ac.signal });
+    setTimeout(() => ac.abort(), 300);
+    const r = await run;
+    assert.equal(r.record?.status, "aborted");
+    assert.deepEqual(r.record?.delivery, {});
+    const job = loadJobs()[0];
+    assert.equal(job.running, null);
+    assert.equal(job.runCount, 0);
+    assert.ok(new Date(job.nextRunAt!).getTime() <= Date.now());
+  });
+
+  it("uses the given pi command when config has none", async () => {
+    saveConfig({ piCommand: [] });
+    addJob(makeJob({ name: "cmd" }));
+    const r = await executeJob("cmd", { piCommand: [process.execPath, fakePi] });
+    assert.equal(r.record?.status, "ok");
   });
 
   it("reports a missing working directory", async () => {
@@ -138,23 +159,23 @@ describe("executeJob", () => {
 });
 
 describe("tick", () => {
-  it("starts due jobs in detached runner processes", async () => {
+  it("hands due jobs to the launcher and records the owning pid", () => {
     const created = local(2026, 9, 21, 12, 0);
     addJob(makeJob({ name: "due" }, created, { nextRunAt: new Date(Date.now() - 1000).toISOString() }));
     addJob(makeJob({ name: "later" }, created, { nextRunAt: new Date(Date.now() + 3_600_000).toISOString() }));
 
-    const result = tick(new Date());
+    const launched: string[] = [];
+    const result = tick(new Date(), (job) => {
+      launched.push(job.name);
+      return 4242;
+    });
     assert.deepEqual(result.started, ["due"]);
-    assert.ok(loadJobs().find((j) => j.name === "due")?.running?.pid);
-
-    await waitFor(() => loadJobs().find((j) => j.name === "due")?.lastStatus === "ok");
-    const due = loadJobs().find((j) => j.name === "due")!;
-    assert.equal(due.running, null);
-    assert.ok(new Date(due.nextRunAt!).getTime() > Date.now());
-    assert.equal(loadJobs().find((j) => j.name === "later")?.runCount, 0);
+    assert.deepEqual(launched, ["due"]);
+    assert.equal(loadJobs().find((j) => j.name === "due")?.running?.pid, 4242);
+    assert.ok(new Date(loadJobs().find((j) => j.name === "due")!.nextRunAt!).getTime() > Date.now());
   });
 
-  it("uses the injected launcher and records launch failures", () => {
+  it("records launch failures", () => {
     addJob(makeJob({ name: "x" }, undefined, { nextRunAt: new Date(Date.now() - 1000).toISOString() }));
     tick(new Date(), () => {
       throw new Error("spawn failed");
@@ -162,6 +183,15 @@ describe("tick", () => {
     const job = loadJobs()[0];
     assert.equal(job.running, null);
     assert.equal(job.lastStatus, "error");
+  });
+
+  it("re-runs a job whose pi died mid-run and records it as crashed", () => {
+    const dead = 2 ** 22 + 12345; // no such pid
+    addJob(makeJob({ name: "cut" }, undefined, { running: { pid: dead, startedAt: "x" } }));
+    const result = tick(new Date(), () => 1);
+    assert.deepEqual(result.crashed, ["cut"]);
+    assert.deepEqual(result.started, ["cut"]);
+    assert.equal(listRuns(loadJobs()[0].id)[0].status, "crashed");
   });
 });
 

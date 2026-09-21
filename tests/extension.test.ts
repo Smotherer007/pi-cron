@@ -14,17 +14,14 @@ const fakePi = {
   getAllTools: () => ["read", "bash", "email_fetch", "email_send"].map((name) => ({ name })),
 } as never;
 
-let installs = 0;
 let runs: string[] = [];
+let active = true;
 const deps = {
-  ensureService: () => {
-    installs++;
-    return { status: { installed: true, platform: "linux" as const, detail: "fake" }, installedNow: installs === 1 };
-  },
-  startRunNow: (job: { name: string }) => {
+  runNow: (job: { name: string }) => {
     runs.push(job.name);
-    return 123;
+    return true;
   },
+  schedulerActive: () => active,
 };
 const tools = createCronTools(fakePi, deps as never);
 const ctx = { cwd: tmpdir() };
@@ -109,21 +106,16 @@ describe("extension entry point", () => {
     } as never);
     assert.deepEqual(registered.sort(), ["cron_create", "cron_delete", "cron_list", "cron_results", "cron_run", "cron_update"]);
     assert.deepEqual(commands, ["cron"]);
-    assert.deepEqual(events, ["session_start"]);
+    assert.deepEqual(events, ["session_start", "session_shutdown"]);
   });
 });
 
-describe("service failures", () => {
-  it("keeps the job and warns when the background service cannot be installed", async () => {
-    saveJobs([]);
-    const broken = createCronTools(fakePi, {
-      ensureService: () => {
-        throw new Error("crontab not found");
-      },
-      startRunNow: () => 0,
-    } as never);
-    const r = await call(broken.cronCreate, { name: "w", prompt: "p", schedule: "every 1h" });
-    assert.match(r.content[0].text, /WARNING.*crontab not found/);
+describe("scheduler hint", () => {
+  it("says so when no interactive pi is scheduling", async () => {
+    active = false;
+    const r = await call(tools.cronCreate, { name: "w", prompt: "p", schedule: "every 1h" });
+    active = true;
+    assert.match(r.content[0].text, /only run while an interactive pi is open/);
     assert.equal(loadJobs().length, 1);
   });
 });
