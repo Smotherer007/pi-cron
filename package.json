@@ -1,6 +1,6 @@
 {
   "name": "@patimweb/pi-cron",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Scheduled prompts for the pi coding agent: save a prompt + schedule + tool allowlist as a cron job that runs in the background, survives restarts and delivers its result.",
   "keywords": [
     "pi-package",
